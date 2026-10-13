@@ -32,3 +32,20 @@ dist/
 *.tmp
 *.temp
 *~
+
+# Private key and credential material
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+*.credentials
+config/*secret*
+config/*credential*
+credentials/
+.aws/
+
+# Local database files
+*.db
+*.sqlite
+*.sqlite3

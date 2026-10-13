@@ -712,3 +712,9 @@ M13 五篇 batch 不在本轮范围内，等待人工审核后再决定是否恢
 
 无。本轮已完成离线验证、parser audit 和 AtlasKV regression 后停止，等待人工审核；
 不进入 M13 batch continuation。
+
+## RISE 工程化 P0 — 源码契约核对（2026-10-13）
+
+### Open issues
+
+- P0 按当前源码冻结：Commit Gate 通过且无新科研证据时，Controller 直接返回 `COMMIT`。但 `docs/implementation_spec.md` 第 3.11 节仍允许 Controller 在 Gate 通过后选择 `SEEK_INSPIRATION`；源码和 `test_commit_ready_state_does_not_reopen_inspiration_without_new_evidence` 与该文本不一致。进入 P1 前需确认方法文档应同步当前源码，还是另行授权改变 Controller 行为。P0 不修改科研代码或方法定义。

@@ -807,15 +807,20 @@ class M11TrajectoryTests(unittest.TestCase):
             provider_name = "failing_fixture"
             last_request_count = 1
 
+            def __init__(self):
+                self.calls = 0
+
             def get_related_paper_pool(self, seed_context, *, limit=20):
+                self.calls += 1
                 raise RetrievalError("generic provider failure")
 
+        provider = FailingProvider()
         injected = modules()
         injected = TrajectoryModules(
             gap_discovery=injected.gap_discovery,
             solution_ideation=injected.solution_ideation,
             related_work_verification=RelatedWorkVerificationModule(
-                FakeLLMClient([]), FailingProvider()
+                FakeLLMClient([]), provider
             ),
             inspiration_retrieval=injected.inspiration_retrieval,
             targeted_revision=injected.targeted_revision,
@@ -831,8 +836,10 @@ class M11TrajectoryTests(unittest.TestCase):
                 output_dir=directory,
             ).run(seed(), full_paper_reading_context=reading())
             self.assertEqual(result.status, "failed")
+            self.assertEqual(result.error_type, "RetrievalError")
             self.assertEqual(result.budget.steps_used, 1)
             self.assertEqual(result.budget.searches_used, 1)
+            self.assertEqual(provider.calls, 1)
             context = TrajectoryContext.load(seed(), directory)
             self.assertTrue(
                 any(event.event_type == "runner_action_failed" for event in context.trajectory.get_events())
@@ -842,6 +849,27 @@ class M11TrajectoryTests(unittest.TestCase):
                 seed(), Path(directory, "trajectory.jsonl"), Path(directory, "trajectory_replay.jsonl")
             )
             self.assertEqual(replayed.get_memory(), context.get_memory())
+
+    def test_finalizer_failure_keeps_commit_snapshot_and_terminal_outcome(self):
+        injected = modules()
+        injected.finalizer.llm_client = FakeLLMClient([])
+        with tempfile.TemporaryDirectory() as directory:
+            result = TrajectoryRunner(
+                injected,
+                budget=BudgetTracker(max_steps=5, max_searches=1),
+                output_dir=directory,
+            ).run(seed(), full_paper_reading_context=reading())
+
+            self.assertEqual(result.status, "finalization_failed")
+            self.assertIsNotNone(result.commit_snapshot)
+            self.assertIsNone(result.final_proposal)
+            self.assertEqual(result.budget.steps_used, 5)
+            self.assertEqual(result.budget.searches_used, 1)
+            self.assertTrue(Path(directory, "commit_snapshot.json").exists())
+            manifest = json.loads(Path(directory, "run_manifest.json").read_text())
+            self.assertEqual(manifest["payload"]["status"], "finalization_failed")
+            self.assertTrue(manifest["payload"]["commit_snapshot_written"])
+            self.assertFalse(manifest["payload"]["final_proposal_written"])
 
 
 if __name__ == "__main__":
