@@ -1,0 +1,9 @@
+{
+  "api_key": "",
+  "base_url": "https://s2api.ominiai.cn/s2",
+  "auth_mode": "bearer",
+  "timeout_seconds": 30,
+  "max_retries": 1,
+  "min_request_interval_seconds": 1.0,
+  "cache_dir": "cache/semantic_scholar_proxy"
+}

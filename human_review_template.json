@@ -1,0 +1,22 @@
+{
+  "paper_id": "",
+  "reviewer": "",
+  "gap_quality": {
+    "method_level": null,
+    "evidence_grounded": null,
+    "actionable": null,
+    "novelty_value": null,
+    "notes": ""
+  },
+  "solution_quality": {
+    "mechanism_novelty": null,
+    "preserves_original_strength": null,
+    "experiment_feasible": null,
+    "notes": ""
+  },
+  "final_proposal_quality": {
+    "research_worthiness": null,
+    "publication_potential": null,
+    "notes": ""
+  }
+}
