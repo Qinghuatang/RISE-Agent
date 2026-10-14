@@ -7,8 +7,11 @@ and ``RISEActionAdapter``.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from pathlib import Path
+from threading import Lock, RLock
 from typing import Any, Callable
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from ..controller.budget import BudgetTracker, ControllerBudget
 from ..ingestion.markdown import FullPaperReadingContext
@@ -16,7 +19,12 @@ from ..models.base import ScientificAction
 from ..models.seed import SeedPaperContext
 from ..runner.trajectory_runner import TrajectoryModules
 from .action_adapter import RISEActionAdapter
-from .graph_state import PaperInputReference, RISEGraphState
+from .graph_state import (
+    GraphStateValidationError,
+    PaperInputReference,
+    RISEGraphState,
+)
+from .paper_store import PaperInputIntegrityError, PaperInputStore
 
 
 ACTION_NODE_NAMES: dict[str, str] = {
@@ -30,10 +38,43 @@ ACTION_NODE_NAMES: dict[str, str] = {
 }
 
 _TERMINAL_STATUSES = {"committed", "stopped", "failed", "finalization_failed"}
+_THREAD_LOCKS: dict[str, RLock] = {}
+_THREAD_LOCKS_GUARD = Lock()
 
 
 class GraphRoutingInvariantError(RuntimeError):
     """Raised when a validated graph snapshot cannot select a legal next node."""
+
+
+class PersistentExecutionError(RuntimeError):
+    """Raised when a checkpoint cannot safely be used to start or resume a run."""
+
+
+class ExistingThreadError(PersistentExecutionError):
+    """Raised when new work is submitted with a thread that already has state."""
+
+
+class MissingCheckpointError(PersistentExecutionError):
+    """Raised when resume is requested for a thread without a checkpoint."""
+
+
+@contextmanager
+def _lock_thread(thread_id: str):
+    with _THREAD_LOCKS_GUARD:
+        lock = _THREAD_LOCKS.setdefault(thread_id, RLock())
+    with lock:
+        yield
+
+
+def _canonical_thread_id(thread_id: str) -> str:
+    try:
+        return str(UUID(thread_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("thread_id must be a valid UUID") from exc
+
+
+def _recursion_limit_for_remaining_steps(remaining_steps: int) -> int:
+    return max(3, 2 * remaining_steps + 3)
 
 
 def _as_graph_state(value: Any) -> RISEGraphState:
@@ -57,12 +98,16 @@ class LangGraphTrajectoryRunner:
         budget: BudgetTracker | ControllerBudget,
         run_id: str | None = None,
         paper_input: PaperInputReference | None = None,
+        checkpointer: Any | None = None,
+        paper_store: PaperInputStore | None = None,
     ) -> None:
         self.modules = modules
         self.adapter = RISEActionAdapter(modules)
         self.initial_budget = budget.snapshot()
         self.run_id = run_id or uuid4().hex
         self.paper_input = paper_input
+        self.checkpointer = checkpointer
+        self.paper_store = paper_store
 
     @property
     def recursion_limit(self) -> int:
@@ -74,15 +119,15 @@ class LangGraphTrajectoryRunner:
         path without imposing LangGraph's unrelated default step ceiling.
         """
 
-        remaining_steps = self.initial_budget.remaining_steps
-        return max(3, 2 * remaining_steps + 3)
+        return _recursion_limit_for_remaining_steps(self.initial_budget.remaining_steps)
 
     def build_graph(
         self,
         *,
         full_paper_reading_context: FullPaperReadingContext | str | None = None,
+        checkpointer: Any | None = None,
     ) -> Any:
-        """Compile the P1-C graph without a checkpointer or Action retries."""
+        """Compile the graph without adding Action retries."""
 
         try:
             from langgraph.graph import END, START, StateGraph
@@ -148,7 +193,7 @@ class LangGraphTrajectoryRunner:
                     {"controller": "controller", "end": END},
                 )
         graph.add_edge("finalizer", END)
-        return graph.compile()
+        return graph.compile(checkpointer=checkpointer)
 
     def _action_node(self, expected_action: ScientificAction) -> Callable[[Any], dict[str, Any]]:
         def execute(raw_state: Any) -> dict[str, Any]:
@@ -227,7 +272,11 @@ class LangGraphTrajectoryRunner:
         *,
         full_paper_reading_context: FullPaperReadingContext | str | None = None,
     ) -> RISEGraphState:
-        """Initialize and execute one full LangGraph-managed trajectory."""
+        """Run one trajectory without persistence, preserving the P1 entry point.
+
+        Checkpoint-backed callers should use ``start_persistent`` or
+        ``resume_persistent`` instead.
+        """
 
         initial_state = RISEGraphState.initialize(
             seed_context,
@@ -244,9 +293,144 @@ class LangGraphTrajectoryRunner:
         )
         return RISEGraphState.from_payload(result)
 
+    def start_persistent(
+        self,
+        seed_context: SeedPaperContext,
+        *,
+        thread_id: str,
+        markdown: str | bytes | Path,
+    ) -> RISEGraphState:
+        """Create and run a new PostgreSQL-checkpointed trajectory.
+
+        ``markdown`` accepts UTF-8 source text/bytes or a ``pathlib.Path``.
+        The task UUID is also stored as ``run_id`` so restored snapshots keep
+        the same identity. Existing threads are never overwritten.
+        """
+
+        checkpointer, paper_store = self._require_persistence()
+        canonical_id = _canonical_thread_id(thread_id)
+        config = self._thread_config(canonical_id)
+        with _lock_thread(canonical_id):
+            if checkpointer.get_tuple(config) is not None:
+                raise ExistingThreadError(
+                    f"thread already has a checkpoint: {canonical_id}"
+                )
+
+            paper_input = paper_store.persist(markdown)
+            reading_context = paper_store.build_reading_context(
+                paper_input,
+                paper_id=seed_context.paper_id,
+            )
+            initial_state = RISEGraphState.initialize(
+                seed_context,
+                self.initial_budget,
+                run_id=canonical_id,
+                paper_input=paper_input,
+            )
+            graph = self.build_graph(
+                full_paper_reading_context=reading_context,
+                checkpointer=checkpointer,
+            )
+            result = graph.invoke(
+                initial_state.to_payload(),
+                config={**config, "recursion_limit": self.recursion_limit},
+                durability="sync",
+            )
+            return RISEGraphState.from_payload(result)
+
+    def resume_persistent(self, *, thread_id: str) -> RISEGraphState:
+        """Resume the latest reliable checkpoint without reinitializing RISE."""
+
+        checkpointer, paper_store = self._require_persistence()
+        canonical_id = _canonical_thread_id(thread_id)
+        config = self._thread_config(canonical_id)
+        with _lock_thread(canonical_id):
+            if checkpointer.get_tuple(config) is None:
+                raise MissingCheckpointError(
+                    f"no checkpoint exists for thread: {canonical_id}"
+                )
+
+            # Read the saved snapshot before rebuilding the runtime closure.
+            # This graph is used only for state inspection; it executes no node.
+            inspection_graph = self.build_graph(checkpointer=checkpointer)
+            snapshot = inspection_graph.get_state(config)
+            if not snapshot.values:
+                raise MissingCheckpointError(
+                    f"checkpoint contains no Graph State for thread: {canonical_id}"
+                )
+            schema_version = snapshot.values.get("schema_version")
+            if schema_version != 1:
+                raise PersistentExecutionError(
+                    f"unsupported checkpoint Graph State schema_version: {schema_version!r}"
+                )
+            try:
+                state = _as_graph_state(snapshot.values)
+            except GraphStateValidationError as exc:
+                raise PersistentExecutionError(
+                    f"checkpoint Graph State is invalid for thread {canonical_id}"
+                ) from exc
+
+            if state.run_id != canonical_id:
+                raise PersistentExecutionError(
+                    "checkpoint run_id does not match its stable thread_id"
+                )
+            if state.rise_status in _TERMINAL_STATUSES:
+                return state
+            if not snapshot.next:
+                raise PersistentExecutionError(
+                    "non-terminal checkpoint has no pending LangGraph node"
+                )
+            if state.paper_input is None:
+                raise PaperInputIntegrityError(
+                    "non-terminal checkpoint has no persisted paper input reference"
+                )
+
+            reading_context = paper_store.build_reading_context(
+                state.paper_input,
+                paper_id=state.seed_context.paper_id,
+            )
+            graph = self.build_graph(
+                full_paper_reading_context=reading_context,
+                checkpointer=checkpointer,
+            )
+            result = graph.invoke(
+                None,
+                config={
+                    **config,
+                    "recursion_limit": _recursion_limit_for_remaining_steps(
+                        state.budget.remaining_steps
+                    ),
+                },
+                durability="sync",
+            )
+            try:
+                return RISEGraphState.from_payload(result)
+            except GraphStateValidationError as exc:
+                raise PersistentExecutionError(
+                    f"resumed Graph State is invalid for thread {canonical_id}"
+                ) from exc
+
+    def _require_persistence(self) -> tuple[Any, PaperInputStore]:
+        if self.checkpointer is None:
+            raise PersistentExecutionError(
+                "persistent execution requires a checkpointer"
+            )
+        if self.paper_store is None:
+            raise PersistentExecutionError(
+                "persistent execution requires a stable PaperInputStore"
+            )
+        return self.checkpointer, self.paper_store
+
+    @staticmethod
+    def _thread_config(thread_id: str) -> dict[str, Any]:
+        return {"configurable": {"thread_id": thread_id}}
+
 
 __all__ = [
     "ACTION_NODE_NAMES",
+    "ExistingThreadError",
     "GraphRoutingInvariantError",
     "LangGraphTrajectoryRunner",
+    "MissingCheckpointError",
+    "PersistentExecutionError",
 ]
