@@ -266,6 +266,95 @@ class LangGraphTrajectoryRunner:
             )
         return "finalizer"
 
+    @staticmethod
+    def _has_durable_completed_node_result(snapshot: Any, state: RISEGraphState) -> bool:
+        """Accept a completed task result saved before the next root checkpoint.
+
+        With synchronous durability, LangGraph may have committed a node's
+        ``put_writes`` record while a subsequent checkpoint ``put`` fails.
+        In that case ``get_state`` exposes the completed node result and its
+        updated channels, but ``snapshot.next`` is empty. LangGraph can resume
+        from that durable task result without invoking the node again.
+        """
+
+        tasks = getattr(snapshot, "tasks", ())
+        if len(tasks) != 1:
+            return False
+        task = tasks[0]
+        if task.result is None or task.error is not None or task.interrupts:
+            return False
+        try:
+            result_state = _as_graph_state(task.result)
+        except GraphStateValidationError:
+            return False
+        if result_state != state:
+            return False
+
+        if state.decision_pending:
+            expected_completed_node = "controller"
+        elif state.commit_snapshot is not None:
+            expected_completed_node = "commit"
+        elif state.rise_status == "running" and state.bootstrap_complete:
+            routing = state.controller_routing
+            if routing is None:
+                expected_completed_node = "bootstrap"
+            elif routing.decision is not None:
+                expected_completed_node = ACTION_NODE_NAMES.get(
+                    routing.decision.action
+                )
+            else:
+                return False
+        else:
+            return False
+        return task.name == expected_completed_node
+
+    @staticmethod
+    def _expected_resume_node(state: RISEGraphState) -> str:
+        """Derive the only legal continuation from the saved RISE snapshot."""
+
+        if state.rise_status == "initialized":
+            if state.bootstrap_complete or state.decision_pending:
+                raise PersistentExecutionError(
+                    "initialized checkpoint has inconsistent Bootstrap state"
+                )
+            return "bootstrap"
+
+        if state.rise_status != "running" or not state.bootstrap_complete:
+            raise PersistentExecutionError(
+                "non-terminal checkpoint has inconsistent RISE execution state"
+            )
+
+        if state.decision_pending:
+            routing = state.controller_routing
+            if routing is None or routing.decision is None:
+                raise PersistentExecutionError(
+                    "pending Action checkpoint has no saved Controller decision"
+                )
+            node = ACTION_NODE_NAMES.get(routing.decision.action)
+            if node is None:
+                raise PersistentExecutionError(
+                    "pending Action checkpoint selects an unknown Scientific Action"
+                )
+            if state.commit_snapshot is not None:
+                raise PersistentExecutionError(
+                    "pending Action checkpoint cannot already contain a CommitSnapshot"
+                )
+            return node
+
+        if state.commit_snapshot is not None:
+            routing = state.controller_routing
+            if (
+                routing is None
+                or routing.decision is None
+                or routing.decision.action != "COMMIT"
+            ):
+                raise PersistentExecutionError(
+                    "CommitSnapshot checkpoint has no matching saved Commit decision"
+                )
+            return "finalizer"
+
+        return "controller"
+
     def run(
         self,
         seed_context: SeedPaperContext,
@@ -376,10 +465,22 @@ class LangGraphTrajectoryRunner:
                 )
             if state.rise_status in _TERMINAL_STATUSES:
                 return state
-            if not snapshot.next:
+            if not snapshot.next and not self._has_durable_completed_node_result(
+                snapshot, state
+            ):
                 raise PersistentExecutionError(
-                    "non-terminal checkpoint has no pending LangGraph node"
+                    "non-terminal checkpoint has no pending LangGraph node or "
+                    "durable completed task result"
                 )
+            expected_node = self._expected_resume_node(state)
+            if tuple(snapshot.next) != (expected_node,):
+                if snapshot.next or not self._has_durable_completed_node_result(
+                    snapshot, state
+                ):
+                    raise PersistentExecutionError(
+                        "checkpoint pending node does not match saved RISE state: "
+                        f"expected {(expected_node,)!r}, got {tuple(snapshot.next)!r}"
+                    )
             if state.paper_input is None:
                 raise PaperInputIntegrityError(
                     "non-terminal checkpoint has no persisted paper input reference"
