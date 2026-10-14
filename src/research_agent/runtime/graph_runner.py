@@ -115,7 +115,11 @@ class LangGraphTrajectoryRunner:
 
         graph.add_node("finalizer", finalizer_node)
         graph.add_edge(START, "bootstrap")
-        graph.add_edge("bootstrap", "controller")
+        graph.add_conditional_edges(
+            "bootstrap",
+            self._route_after_bootstrap,
+            {"controller": "controller", "end": END},
+        )
 
         controller_destinations = {
             "end": END,
@@ -162,6 +166,17 @@ class LangGraphTrajectoryRunner:
             return self.adapter.execute_selected_action(state).to_payload()
 
         return execute
+
+    @staticmethod
+    def _route_after_bootstrap(raw_state: Any) -> str:
+        state = _as_graph_state(raw_state)
+        if state.rise_status in _TERMINAL_STATUSES:
+            return "end"
+        if state.rise_status != "running" or not state.bootstrap_complete:
+            raise GraphRoutingInvariantError(
+                "Bootstrap did not complete or produce a terminal result"
+            )
+        return "controller"
 
     @staticmethod
     def _route_controller_decision(raw_state: Any) -> str:
