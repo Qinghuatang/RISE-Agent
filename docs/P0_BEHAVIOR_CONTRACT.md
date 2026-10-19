@@ -44,10 +44,10 @@ Runner 为每个 Action 追加 `controller_decided`、`budget_updated` 和决策
 |---|---|---|---|
 | `committed` | `completed` | `committed` | Proposal 与 Snapshot 均已生成。 |
 | `stopped` | `completed` | `stopped` | Controller 按科研条件/预算正常终止；可没有 Proposal。 |
-| `failed` | `failed` | `failed` | Bootstrap、Controller 或已派发 Action 的异常；保存原始 `error_type`/摘要，不自动重试该 Action。 |
-| `finalization_failed` | `failed` | `finalization_failed` | Commit 已成立、Snapshot 保留，但 Proposal 缺失。 |
-| Worker/数据库/Checkpoint 故障且未恢复 | `failed` | `null`，若此前已有真实 RISE 终态则保留该值 | 这是任务基础设施失败，不能伪造成科研 `failed` 结果。恢复中保持非终态状态。 |
-| 用户取消 | `cancelled` | `null` 或已有的真实 RISE 结果 | 取消是业务生命周期，不新增 RISE outcome；保留最后持久化的科研状态。 |
+| `failed` | `completed` | `failed` | Bootstrap、Controller 或已派发 Action 的异常；这是已确认的 RISE 终态，保存原始 `error_type`/摘要，不自动重试该 Action。 |
+| `finalization_failed` | `completed` | `finalization_failed` | Commit 已成立、Snapshot 保留，但 Proposal 缺失；这是已确认的 RISE 终态。 |
+| Worker/数据库/Checkpoint 故障且恢复耗尽 | `failed` | `null`；若 Checkpoint 已有 RISE 终态，则按该终态映射为 `completed` | 这是任务基础设施失败，不能伪造成科研 `failed` 结果。恢复中保持非终态状态。 |
+| 用户取消 | `cancelled` | `null` | 仅在 Graph 尚未进入 RISE 终态时取消；若取消请求到达前 Checkpoint 已是 RISE 终态，则该终态优先。 |
 | Pilot 预检/Seed Extraction 在 Runner 前失败 | `failed` | `null` | 现有 Pilot Manifest 的 `preflight_failed`/`failed` 不是 `TrajectoryRunResult` 枚举；另存失败阶段与错误类型。 |
 
 取消应在高层 Action 的持久化边界阻止后续 Action。Worker 崩溃可从最后持久化边界恢复，但不能将已返回的科研 Action 错误改成重试策略。

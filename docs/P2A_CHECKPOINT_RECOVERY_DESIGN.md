@@ -63,8 +63,8 @@ Checkpoint 写入错误属于基础设施故障，向 Worker 传播；不能转�
 | RISE 终态 | 业务 `task_status` | `rise_outcome` |
 |---|---|---|
 | `committed` / `stopped` | `completed` | 保留对应 RISE 终态 |
-| `failed` / `finalization_failed` | `failed` | 保留对应 RISE 终态 |
-| 尚未恢复完成的基础设施错误 | 恢复期间保持非终态；重试耗尽后 `failed` | `null`，除非 Checkpoint 已有真实 RISE 终态 |
+| `failed` / `finalization_failed` | `completed` | 保留对应 RISE 终态 |
+| 尚未恢复完成的基础设施错误 | 恢复期间保持非终态；重试耗尽后 `failed` | `null`；若 Checkpoint 已有真实 RISE 终态，则按该终态映射为 `completed` |
 
 这只是未来业务层映射；P2 不建立任务队列表。
 

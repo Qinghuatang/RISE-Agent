@@ -60,9 +60,9 @@
 
 ### 双状态语义
 
-- `task_status`：`queued`、`running`、`completed`、`failed`、`cancelled`；如需要内部 `cancel_requested`/`recovering` 标记，作为明确的附属字段或非终态，不混淆最终状态。
+- `task_status`：`queued`、`running`、`cancel_requested`、`completed`、`failed`、`cancelled`。`cancel_requested` 是运行中的过渡状态；恢复次数单独记录，不另设 `recovering` 任务状态。
 - `rise_outcome`：沿用源码实际枚举（例如 `committed`、`stopped`、`failed`、`finalization_failed`），在 P0 确认，不擅自引入新科研枚举。
-- `completed` 只表示一次 RISE 流程正常终结，不等于必定 `committed`。科研失败可作为 RISE 正常终结的结果；真正 Worker/基础设施不可恢复异常对应任务 `failed`。
+- 所有已确认的 RISE 终态（`committed`、`stopped`、`failed`、`finalization_failed`）均映射为业务 `completed`，并在 `rise_outcome` 中保留准确结果。`task_status=failed` 仅表示输入预检失败或不可恢复的 Worker/基础设施失败，且没有已确认 RISE 终态；二者不能混淆。
 
 ### 轨迹与应用事件
 
