@@ -202,6 +202,59 @@ def test_old_lease_token_cannot_heartbeat_or_complete_after_reclaim(repository):
     assert repo.get_task(task.id).lease_token == second_owner.lease_token
 
 
+def test_expired_lease_is_reclaimed_only_after_expiry_and_fenced_by_new_token(repository):
+    repo, _, _ = repository
+    task = create_task(repo)
+    owner = claim(repo, task.id, lease_seconds=0.05)
+    assert repo.list_expired_tasks() == []
+    time.sleep(0.08)
+    expired = repo.list_expired_tasks()
+    assert [row.id for row in expired] == [task.id]
+
+    reclaimed = repo.reclaim_expired_task(
+        task_id=task.id,
+        worker_id="recovery-worker",
+        lease_seconds=30,
+        max_recoveries=3,
+    )
+    assert reclaimed is not None
+    assert reclaimed.recovery_exhausted is False
+    assert reclaimed.task.task_status == TaskStatus.RUNNING.value
+    assert reclaimed.task.worker_id == "recovery-worker"
+    assert reclaimed.task.lease_token != owner.lease_token
+    assert reclaimed.task.recovery_count == owner.recovery_count + 1
+    assert not repo.heartbeat(
+        task_id=task.id,
+        worker_id=owner.worker_id,
+        lease_token=owner.lease_token,
+        lease_seconds=30,
+    )
+    with pytest.raises(LeaseOwnershipError):
+        repo.mark_completed(
+            task_id=task.id,
+            worker_id=owner.worker_id,
+            lease_token=owner.lease_token,
+            rise_outcome=RiseOutcome.COMMITTED.value,
+        )
+
+
+def test_expired_lease_at_recovery_limit_gets_reconciliation_only_claim(repository):
+    repo, _, _ = repository
+    task = create_task(repo)
+    owner = claim(repo, task.id, lease_seconds=0.05)
+    time.sleep(0.08)
+    reclaimed = repo.reclaim_expired_task(
+        task_id=task.id,
+        worker_id="recovery-worker",
+        lease_seconds=30,
+        max_recoveries=0,
+    )
+    assert reclaimed is not None
+    assert reclaimed.recovery_exhausted is True
+    assert reclaimed.task.recovery_count == 0
+    assert reclaimed.task.lease_token != owner.lease_token
+
+
 def test_expired_lease_cannot_be_renewed_or_used_for_terminal_transition(repository):
     repo, _, _ = repository
     task = create_task(repo)

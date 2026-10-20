@@ -10,7 +10,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock, RLock
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 from uuid import UUID, uuid4
 
 from ..controller.budget import BudgetTracker, ControllerBudget
@@ -48,6 +48,9 @@ class GraphRoutingInvariantError(RuntimeError):
 
 class PersistentExecutionError(RuntimeError):
     """Raised when a checkpoint cannot safely be used to start or resume a run."""
+
+
+BoundaryCheck = Callable[[str, RISEGraphState], str | None]
 
 
 class ExistingThreadError(PersistentExecutionError):
@@ -126,6 +129,8 @@ class LangGraphTrajectoryRunner:
         *,
         full_paper_reading_context: FullPaperReadingContext | str | None = None,
         checkpointer: Any | None = None,
+        interrupt_before_nodes: Sequence[str] | None = None,
+        boundary_check: BoundaryCheck | None = None,
     ) -> Any:
         """Compile the graph without adding Action retries."""
 
@@ -138,7 +143,18 @@ class LangGraphTrajectoryRunner:
 
         graph = StateGraph(RISEGraphState)
 
+        def check_boundary(node_name: str, raw_state: Any) -> None:
+            if boundary_check is None:
+                return
+            state = _as_graph_state(raw_state)
+            reason = boundary_check(node_name, state)
+            if reason is not None:
+                from langgraph.types import interrupt
+
+                interrupt({"reason": reason, "node": node_name})
+
         def bootstrap_node(raw_state: Any) -> dict[str, Any]:
+            check_boundary("bootstrap", raw_state)
             state = _as_graph_state(raw_state)
             updated = self.adapter.bootstrap(
                 state,
@@ -147,15 +163,17 @@ class LangGraphTrajectoryRunner:
             return updated.to_payload()
 
         def controller_node(raw_state: Any) -> dict[str, Any]:
+            check_boundary("controller", raw_state)
             return self.adapter.decide(_as_graph_state(raw_state)).to_payload()
 
         graph.add_node("bootstrap", bootstrap_node)
         graph.add_node("controller", controller_node)
 
         for action, node_name in ACTION_NODE_NAMES.items():
-            graph.add_node(node_name, self._action_node(action))
+            graph.add_node(node_name, self._action_node(action, check_boundary))
 
         def finalizer_node(raw_state: Any) -> dict[str, Any]:
+            check_boundary("finalizer", raw_state)
             return self.adapter.finalize(_as_graph_state(raw_state)).to_payload()
 
         graph.add_node("finalizer", finalizer_node)
@@ -193,10 +211,21 @@ class LangGraphTrajectoryRunner:
                     {"controller": "controller", "end": END},
                 )
         graph.add_edge("finalizer", END)
-        return graph.compile(checkpointer=checkpointer)
+        return graph.compile(
+            checkpointer=checkpointer,
+            interrupt_before=(
+                list(interrupt_before_nodes) if interrupt_before_nodes is not None else None
+            ),
+        )
 
-    def _action_node(self, expected_action: ScientificAction) -> Callable[[Any], dict[str, Any]]:
+    def _action_node(
+        self,
+        expected_action: ScientificAction,
+        check_boundary: Callable[[str, Any], None] | None = None,
+    ) -> Callable[[Any], dict[str, Any]]:
         def execute(raw_state: Any) -> dict[str, Any]:
+            if check_boundary is not None:
+                check_boundary(ACTION_NODE_NAMES[expected_action], raw_state)
             state = _as_graph_state(raw_state)
             routing = state.controller_routing
             if (
@@ -355,6 +384,48 @@ class LangGraphTrajectoryRunner:
 
         return "controller"
 
+    def has_persistent_checkpoint(self, *, thread_id: str) -> bool:
+        """Return whether the configured saver has a checkpoint for this thread."""
+
+        if self.checkpointer is None:
+            raise PersistentExecutionError("persistent execution requires a checkpointer")
+        canonical_id = _canonical_thread_id(thread_id)
+        with _lock_thread(canonical_id):
+            return self.checkpointer.get_tuple(self._thread_config(canonical_id)) is not None
+
+    def load_persistent_state(self, *, thread_id: str) -> RISEGraphState | None:
+        """Read and validate a saved state without advancing the graph."""
+
+        if self.checkpointer is None:
+            raise PersistentExecutionError("persistent execution requires a checkpointer")
+        canonical_id = _canonical_thread_id(thread_id)
+        config = self._thread_config(canonical_id)
+        with _lock_thread(canonical_id):
+            if self.checkpointer.get_tuple(config) is None:
+                return None
+            graph = self.build_graph(checkpointer=self.checkpointer)
+            snapshot = graph.get_state(config)
+            if not snapshot.values:
+                raise MissingCheckpointError(
+                    f"checkpoint contains no Graph State for thread: {canonical_id}"
+                )
+            schema_version = snapshot.values.get("schema_version")
+            if schema_version != 1:
+                raise PersistentExecutionError(
+                    f"unsupported checkpoint Graph State schema_version: {schema_version!r}"
+                )
+            try:
+                state = _as_graph_state(snapshot.values)
+            except GraphStateValidationError as exc:
+                raise PersistentExecutionError(
+                    f"checkpoint Graph State is invalid for thread {canonical_id}"
+                ) from exc
+            if state.run_id != canonical_id:
+                raise PersistentExecutionError(
+                    "checkpoint run_id does not match its stable thread_id"
+                )
+            return state
+
     def run(
         self,
         seed_context: SeedPaperContext,
@@ -388,6 +459,8 @@ class LangGraphTrajectoryRunner:
         *,
         thread_id: str,
         markdown: str | bytes | Path,
+        interrupt_before_nodes: Sequence[str] | None = None,
+        boundary_check: BoundaryCheck | None = None,
     ) -> RISEGraphState:
         """Create and run a new PostgreSQL-checkpointed trajectory.
 
@@ -419,6 +492,8 @@ class LangGraphTrajectoryRunner:
             graph = self.build_graph(
                 full_paper_reading_context=reading_context,
                 checkpointer=checkpointer,
+                interrupt_before_nodes=interrupt_before_nodes,
+                boundary_check=boundary_check,
             )
             result = graph.invoke(
                 initial_state.to_payload(),
@@ -427,7 +502,13 @@ class LangGraphTrajectoryRunner:
             )
             return RISEGraphState.from_payload(result)
 
-    def resume_persistent(self, *, thread_id: str) -> RISEGraphState:
+    def resume_persistent(
+        self,
+        *,
+        thread_id: str,
+        interrupt_before_nodes: Sequence[str] | None = None,
+        boundary_check: BoundaryCheck | None = None,
+    ) -> RISEGraphState:
         """Resume the latest reliable checkpoint without reinitializing RISE."""
 
         checkpointer, paper_store = self._require_persistence()
@@ -493,6 +574,8 @@ class LangGraphTrajectoryRunner:
             graph = self.build_graph(
                 full_paper_reading_context=reading_context,
                 checkpointer=checkpointer,
+                interrupt_before_nodes=interrupt_before_nodes,
+                boundary_check=boundary_check,
             )
             result = graph.invoke(
                 None,

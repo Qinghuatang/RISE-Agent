@@ -22,6 +22,7 @@ from .contracts import (
     RISE_TERMINAL_OUTCOMES,
     TERMINAL_TASK_STATUSES,
     CreateArtifact,
+    ExpiredTaskClaim,
     TaskArtifactRecord,
     TaskEventRecord,
     TaskPageCursor,
@@ -350,6 +351,138 @@ class TaskRepository:
                 event_key=f"task:{row.id}:attempt:{row.attempt_count}:started",
                 payload={"attempt": row.attempt_count, "worker_id": worker_id},
             )
+            session.flush()
+            return _task_record(row)
+
+    def list_expired_tasks(self, *, limit: int = 50) -> list[TaskRecord]:
+        """List expired active leases for lock-first recovery discovery.
+
+        This method does not claim or mutate rows. A Worker must first acquire
+        the thread advisory lock, then call ``reclaim_expired_task`` to fence
+        out any prior executor before changing the lease.
+        """
+
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        now = _now()
+        with self._sessions() as session:
+            rows = session.scalars(
+                select(Task)
+                .where(
+                    Task.task_status.in_(ACTIVE_TASK_STATUSES),
+                    Task.lease_expires_at <= now,
+                )
+                .order_by(Task.lease_expires_at.asc(), Task.id.asc())
+                .limit(limit)
+            )
+            return [_task_record(row) for row in rows]
+
+    def reclaim_expired_task(
+        self,
+        *,
+        task_id: UUID,
+        worker_id: str,
+        lease_seconds: float,
+        max_recoveries: int,
+    ) -> ExpiredTaskClaim | None:
+        """Replace an expired lease only after the caller holds the PG thread lock.
+
+        The advisory lock is deliberately acquired by the Worker before this
+        transaction. At the retry limit, the new lease is reconciliation-only:
+        it lets the Worker inspect a terminal checkpoint, but must not replay a
+        non-terminal scientific node.
+        """
+
+        if not worker_id or len(worker_id) > 128:
+            raise ValueError("worker_id must contain 1 to 128 characters")
+        if lease_seconds <= 0 or max_recoveries < 0:
+            raise ValueError("lease_seconds must be positive and max_recoveries non-negative")
+        with self._sessions.begin() as session:
+            row = session.scalar(
+                select(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.task_status.in_(ACTIVE_TASK_STATUSES),
+                    Task.lease_expires_at <= _now(),
+                )
+                .with_for_update(skip_locked=True)
+            )
+            if row is None:
+                return None
+
+            recovery_exhausted = row.recovery_count >= max_recoveries
+            now = _now()
+            token = uuid4()
+            row.worker_id = worker_id
+            row.lease_token = token
+            row.heartbeat_at = now
+            row.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            row.updated_at = now
+            if not recovery_exhausted:
+                row.recovery_count += 1
+                row.attempt_count += 1
+                event_type = "task_recovery_started"
+            else:
+                event_type = "task_reconciliation_started"
+            self._append_event_locked(
+                session,
+                row,
+                event_type=event_type,
+                event_key=f"task:{row.id}:lease-reclaim:{token}",
+                payload={
+                    "worker_id": worker_id,
+                    "recovery_count": row.recovery_count,
+                    "recovery_exhausted": recovery_exhausted,
+                },
+            )
+            session.flush()
+            return ExpiredTaskClaim(_task_record(row), recovery_exhausted)
+
+    def record_infrastructure_retry_in_place(
+        self,
+        *,
+        task_id: UUID,
+        worker_id: str,
+        lease_token: UUID,
+        lease_seconds: float,
+        max_recoveries: int,
+        error_type: str,
+        error_summary: str,
+    ) -> TaskRecord:
+        """Count a bounded retry while retaining a cancel-requested lease.
+
+        This is used when a saved CommitSnapshot requires Finalizer completion
+        or checkpoint state cannot yet be inspected safely.
+        """
+
+        if lease_seconds <= 0 or max_recoveries < 0:
+            raise ValueError("lease_seconds must be positive and max_recoveries non-negative")
+        with self._sessions.begin() as session:
+            row = self._owned_task(session, task_id, worker_id, lease_token)
+            if row.recovery_count >= max_recoveries:
+                self._mark_failed_locked(
+                    session,
+                    row,
+                    failure_kind="infrastructure",
+                    error_type=error_type,
+                    error_summary=error_summary,
+                )
+            else:
+                now = _now()
+                row.recovery_count += 1
+                row.failure_kind = "infrastructure_retry"
+                row.error_type = error_type[:255]
+                row.error_summary = _safe_summary(error_summary)
+                row.heartbeat_at = now
+                row.lease_expires_at = now + timedelta(seconds=lease_seconds)
+                row.updated_at = now
+                self._append_event_locked(
+                    session,
+                    row,
+                    event_type="task_infrastructure_retry",
+                    event_key=f"task:{row.id}:in_place_recovery:{row.recovery_count}",
+                    payload={"recovery_count": row.recovery_count},
+                )
             session.flush()
             return _task_record(row)
 

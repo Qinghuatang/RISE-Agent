@@ -63,6 +63,12 @@ class TaskRecord:
 
 
 @dataclass(frozen=True)
+class ExpiredTaskClaim:
+    task: TaskRecord
+    recovery_exhausted: bool
+
+
+@dataclass(frozen=True)
 class TaskEventRecord:
     event_id: UUID
     task_id: UUID

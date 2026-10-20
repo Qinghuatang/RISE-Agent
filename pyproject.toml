@@ -17,6 +17,7 @@ service = ["SQLAlchemy>=2.0,<3.0", "alembic>=1.13,<2.0"]
 
 [project.scripts]
 research-agent = "research_agent.__main__:main"
+research-agent-worker = "research_agent.service.worker_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
