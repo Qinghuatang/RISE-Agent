@@ -71,6 +71,7 @@ class DeepSeekClient(LLMClient):
     def __init__(self, config: DeepSeekConfig, transport: JsonTransport | None = None):
         self.config = config
         self._transport = transport or UrllibJsonTransport()
+        self.last_transport_attempt_count = 0
 
     @classmethod
     def from_env(cls) -> "DeepSeekClient":
@@ -81,6 +82,7 @@ class DeepSeekClient(LLMClient):
         request: LLMRequest,
         output_schema: type[T],
     ) -> StructuredLLMResponse[T]:
+        self.last_transport_attempt_count = 0
         self.config.validate_for_request()
         assert self.config.api_key is not None
         assert self.config.base_url is not None
@@ -128,7 +130,9 @@ class DeepSeekClient(LLMClient):
         payload: Mapping[str, Any],
     ) -> Mapping[str, Any]:
         last_error: LLMTransportError | None = None
+        self.last_transport_attempt_count = 0
         for _ in range(self.config.max_retries + 1):
+            self.last_transport_attempt_count += 1
             try:
                 return self._transport.post_json(
                     url,

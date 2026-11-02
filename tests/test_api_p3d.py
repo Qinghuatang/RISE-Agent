@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -85,6 +86,40 @@ def _save_terminal_state(client: TestClient, task_id: UUID, state: RISEGraphStat
         error_type=state.error_type,
         error_summary=state.error_message,
     )
+
+
+def test_api_request_logs_task_correlation_without_input_content(
+    api_client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+):
+    markdown = "# Private test manuscript\n\nDo not emit this text to logs."
+    with caplog.at_level(logging.INFO, logger="research_agent.metrics"):
+        response = api_client.post(
+            "/api/tasks",
+            json={"markdown": markdown},
+            headers={"X-Request-ID": "p4b-api-test-request"},
+        )
+
+    assert response.status_code == 202
+    assert response.headers["X-Request-ID"] == "p4b-api-test-request"
+    task_id = response.json()["task_id"]
+    structured = [
+        record
+        for record in caplog.records
+        if getattr(record, "rise_event", None)
+        in {"api.task.submitted", "api.request.finished"}
+    ]
+    assert {record.rise_event for record in structured} == {
+        "api.task.submitted",
+        "api.request.finished",
+    }
+    for record in structured:
+        fields = record.rise_fields
+        assert fields["task_id"] == task_id
+        assert fields["thread_id"] == task_id
+        assert fields["request_id"] == "p4b-api-test-request"
+        assert markdown not in str(fields)
+        assert "Do not emit" not in record.getMessage()
 
 
 def test_health_submit_text_and_upload_and_input_validation(api_client: TestClient):

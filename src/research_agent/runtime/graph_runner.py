@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock, RLock
+import time
 from typing import Any, Callable, Sequence
 from uuid import UUID, uuid4
 
@@ -18,6 +19,8 @@ from ..ingestion.markdown import FullPaperReadingContext
 from ..models.base import ScientificAction
 from ..models.seed import SeedPaperContext
 from ..runner.trajectory_runner import TrajectoryModules
+from ..observability.logging import bind_log_context
+from ..observability.telemetry import DEFAULT_TELEMETRY, Telemetry
 from .action_adapter import RISEActionAdapter
 from .graph_state import (
     GraphStateValidationError,
@@ -103,6 +106,7 @@ class LangGraphTrajectoryRunner:
         paper_input: PaperInputReference | None = None,
         checkpointer: Any | None = None,
         paper_store: PaperInputStore | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         self.modules = modules
         self.adapter = RISEActionAdapter(modules)
@@ -111,6 +115,7 @@ class LangGraphTrajectoryRunner:
         self.paper_input = paper_input
         self.checkpointer = checkpointer
         self.paper_store = paper_store
+        self.telemetry = telemetry or DEFAULT_TELEMETRY
 
     @property
     def recursion_limit(self) -> int:
@@ -143,6 +148,68 @@ class LangGraphTrajectoryRunner:
 
         graph = StateGraph(RISEGraphState)
 
+        def observed_node(
+            node_name: str,
+            function: Callable[[Any], dict[str, Any]],
+            *,
+            action: str | None = None,
+        ) -> Callable[[Any], dict[str, Any]]:
+            def execute(raw_state: Any) -> dict[str, Any]:
+                state = _as_graph_state(raw_state)
+                started = time.monotonic_ns()
+                with bind_log_context(
+                    thread_id=state.run_id,
+                    graph_node=node_name,
+                    action=action,
+                ):
+                    self.telemetry.record(
+                        "graph.node.started",
+                        operation=node_name,
+                        status="started",
+                    )
+                    try:
+                        result = function(raw_state)
+                    except Exception as exc:
+                        self.telemetry.record(
+                            "graph.node.finished",
+                            operation=node_name,
+                            node_status="error",
+                            status="error",
+                            duration_ms=(time.monotonic_ns() - started) / 1_000_000,
+                            error_category="infrastructure",
+                            error_type=type(exc).__name__,
+                        )
+                        raise
+
+                    updated = _as_graph_state(result)
+                    budget = updated.budget
+                    selected_action = action
+                    if (
+                        node_name == "controller"
+                        and updated.controller_routing is not None
+                        and updated.controller_routing.decision is not None
+                    ):
+                        decision_action = updated.controller_routing.decision.action
+                        selected_action = str(getattr(decision_action, "value", decision_action))
+                    with bind_log_context(action=selected_action):
+                        self.telemetry.record(
+                            "graph.node.finished",
+                            operation=node_name,
+                            node_status="returned",
+                            status="completed",
+                            duration_ms=(time.monotonic_ns() - started) / 1_000_000,
+                            rise_outcome=updated.rise_status,
+                            action_steps_used=budget.steps_used,
+                            action_steps_remaining=budget.remaining_steps,
+                            searches_used=budget.searches_used,
+                            searches_remaining=budget.remaining_searches,
+                            trajectory_event_count=len(updated.trajectory_events),
+                            replay_record_count=len(updated.replay_records),
+                        )
+                    return result
+
+            return execute
+
         def check_boundary(node_name: str, raw_state: Any) -> None:
             if boundary_check is None:
                 return
@@ -166,17 +233,24 @@ class LangGraphTrajectoryRunner:
             check_boundary("controller", raw_state)
             return self.adapter.decide(_as_graph_state(raw_state)).to_payload()
 
-        graph.add_node("bootstrap", bootstrap_node)
-        graph.add_node("controller", controller_node)
+        graph.add_node("bootstrap", observed_node("bootstrap", bootstrap_node))
+        graph.add_node("controller", observed_node("controller", controller_node))
 
         for action, node_name in ACTION_NODE_NAMES.items():
-            graph.add_node(node_name, self._action_node(action, check_boundary))
+            graph.add_node(
+                node_name,
+                observed_node(
+                    node_name,
+                    self._action_node(action, check_boundary),
+                    action=str(getattr(action, "value", action)),
+                ),
+            )
 
         def finalizer_node(raw_state: Any) -> dict[str, Any]:
             check_boundary("finalizer", raw_state)
             return self.adapter.finalize(_as_graph_state(raw_state)).to_payload()
 
-        graph.add_node("finalizer", finalizer_node)
+        graph.add_node("finalizer", observed_node("finalizer", finalizer_node))
         graph.add_edge(START, "bootstrap")
         graph.add_conditional_edges(
             "bootstrap",
@@ -447,9 +521,11 @@ class LangGraphTrajectoryRunner:
         graph = self.build_graph(
             full_paper_reading_context=full_paper_reading_context
         )
-        result = graph.invoke(
+        result = self._invoke_observed(
+            graph,
             initial_state.to_payload(),
             config={"recursion_limit": self.recursion_limit},
+            thread_id=initial_state.run_id,
         )
         return RISEGraphState.from_payload(result)
 
@@ -495,10 +571,12 @@ class LangGraphTrajectoryRunner:
                 interrupt_before_nodes=interrupt_before_nodes,
                 boundary_check=boundary_check,
             )
-            result = graph.invoke(
+            result = self._invoke_observed(
+                graph,
                 initial_state.to_payload(),
                 config={**config, "recursion_limit": self.recursion_limit},
                 durability="sync",
+                thread_id=canonical_id,
             )
             return RISEGraphState.from_payload(result)
 
@@ -577,7 +655,8 @@ class LangGraphTrajectoryRunner:
                 interrupt_before_nodes=interrupt_before_nodes,
                 boundary_check=boundary_check,
             )
-            result = graph.invoke(
+            result = self._invoke_observed(
+                graph,
                 None,
                 config={
                     **config,
@@ -586,6 +665,7 @@ class LangGraphTrajectoryRunner:
                     ),
                 },
                 durability="sync",
+                thread_id=canonical_id,
             )
             try:
                 return RISEGraphState.from_payload(result)
@@ -604,6 +684,58 @@ class LangGraphTrajectoryRunner:
                 "persistent execution requires a stable PaperInputStore"
             )
         return self.checkpointer, self.paper_store
+
+    def _invoke_observed(
+        self,
+        graph: Any,
+        input_value: Any,
+        *,
+        config: dict[str, Any],
+        thread_id: str,
+        durability: str | None = None,
+    ) -> Any:
+        started = time.monotonic_ns()
+        with bind_log_context(thread_id=thread_id):
+            try:
+                if durability is None:
+                    result = graph.invoke(input_value, config=config)
+                else:
+                    result = graph.invoke(
+                        input_value,
+                        config=config,
+                        durability=durability,
+                    )
+            except Exception as exc:
+                self.telemetry.record(
+                    "graph.execution.finished",
+                    operation="invoke",
+                    status="error",
+                    duration_ms=(time.monotonic_ns() - started) / 1_000_000,
+                    error_category="infrastructure",
+                    error_type=type(exc).__name__,
+                )
+                raise
+            try:
+                state = _as_graph_state(result)
+            except Exception:
+                state = None
+            fields: dict[str, Any] = {
+                "operation": "invoke",
+                "status": "completed",
+                "duration_ms": (time.monotonic_ns() - started) / 1_000_000,
+            }
+            if state is not None:
+                fields.update(
+                    rise_outcome=state.rise_status,
+                    action_steps_used=state.budget.steps_used,
+                    action_steps_remaining=state.budget.remaining_steps,
+                    searches_used=state.budget.searches_used,
+                    searches_remaining=state.budget.remaining_searches,
+                    trajectory_event_count=len(state.trajectory_events),
+                    replay_record_count=len(state.replay_records),
+                )
+            self.telemetry.record("graph.execution.finished", **fields)
+            return result
 
     @staticmethod
     def _thread_config(thread_id: str) -> dict[str, Any]:

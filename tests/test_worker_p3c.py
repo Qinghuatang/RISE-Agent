@@ -16,6 +16,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
 from research_agent.controller.budget import BudgetTracker
+from research_agent.observability.logging import current_log_context
+from research_agent.observability.telemetry import Telemetry
 from research_agent.runtime.checkpointer import open_postgres_checkpointer
 from research_agent.runtime.graph_runner import LangGraphTrajectoryRunner
 from research_agent.runtime.paper_store import PaperInputStore
@@ -153,6 +155,61 @@ def test_worker_executes_queued_tasks_serially_and_projects_confirmed_actions(wo
             assert sum(event.event_type == "rise_action_confirmed" for event in events) == 5
             assert sum(event.event_type == "rise_bootstrap_confirmed" for event in events) == 1
             assert repository.get_task(task.id).attempt_count == 1
+
+
+def test_worker_observes_fake_graph_llm_and_retrieval_calls_with_task_context(
+    worker_database,
+    tmp_path,
+):
+    repository, url, _ = worker_database
+    task = create_task(repository, "p4b-observed-paper")
+    observations: list[dict] = []
+
+    def collect(event: str, **fields) -> None:
+        observations.append(
+            {"event": event, "fields": fields, "context": current_log_context()}
+        )
+
+    telemetry = Telemetry(collect)
+    with open_postgres_checkpointer(url) as saver:
+        worker = make_worker(
+            repository,
+            url,
+            RuntimeFactory(saver, tmp_path / "papers"),
+            telemetry=telemetry,
+        )
+        assert worker.run_once() is True
+
+    stored = repository.get_task(task.id)
+    assert stored.task_status == TaskStatus.COMPLETED.value
+    task_observations = [
+        item for item in observations if item["context"].get("task_id") == str(task.id)
+    ]
+    assert any(item["event"] == "worker.runtime_instrumented" for item in task_observations)
+    assert any(item["event"] == "graph.node.finished" for item in task_observations)
+    llm_calls = [item for item in task_observations if item["event"] == "llm.call"]
+    retrieval_calls = [
+        item for item in task_observations if item["event"] == "retrieval.call"
+    ]
+    assert llm_calls
+    assert retrieval_calls
+    assert any(item["event"] == "worker.task.completed" for item in task_observations)
+    assert all(
+        item["context"].get("thread_id") == str(task.thread_id)
+        for item in task_observations
+    )
+    assert all(
+        item["context"].get("worker_id") == worker.worker_id
+        for item in task_observations
+    )
+    assert all(item["fields"].get("token_usage_known") is False for item in llm_calls)
+    assert len(
+        [
+            event
+            for event in repository.list_events(task.id)
+            if event.event_type == "rise_action_confirmed"
+        ]
+    ) == 5
 
 
 def test_advisory_lock_blocks_cross_process_execution_and_releases_cleanly(worker_database):

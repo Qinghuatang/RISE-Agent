@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import uvicorn
 
+from ..observability.logging import configure_logging
 from .api import APISettings
 
 
 def main() -> None:
+    configure_logging()
     settings = APISettings.from_env()
     uvicorn.run(
         "research_agent.service.api:create_app",

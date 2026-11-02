@@ -10,7 +10,6 @@ import asyncio
 import base64
 import hashlib
 import json
-import logging
 import os
 import re
 import threading
@@ -21,7 +20,7 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, AsyncIterator
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -34,6 +33,8 @@ from starlette.concurrency import run_in_threadpool
 from ..runtime.checkpointer import open_postgres_checkpointer
 from ..runtime.graph_state import RISEGraphState
 from ..runtime.paper_store import PaperInputIntegrityError, PaperInputStore
+from ..observability.logging import bind_log_context
+from ..observability.telemetry import DEFAULT_TELEMETRY, Telemetry
 from .checkpoint_results import CheckpointResultError, read_checkpoint_state
 from .contracts import CreateArtifact, TaskEventRecord, TaskPageCursor, TaskRecord
 from .db import (
@@ -46,7 +47,6 @@ from .errors import IdempotencyConflict, InvalidTaskTransition, TaskNotFound
 from .repository import TaskRepository
 from .api_schemas import TaskAccepted, TaskList, TaskProgress, TaskResult, TaskSummary
 
-logger = logging.getLogger(__name__)
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _RISE_TERMINAL_OUTCOMES = frozenset(
     {"committed", "stopped", "failed", "finalization_failed"}
@@ -115,6 +115,7 @@ class APIResources:
     paper_store: PaperInputStore
     checkpointer: Any
     checkpointer_lock: threading.Lock
+    telemetry: Telemetry
 
 
 class _Submission(BaseModel):
@@ -123,10 +124,15 @@ class _Submission(BaseModel):
     execution_config: dict[str, Any] = Field(default_factory=dict)
 
 
-def create_app(settings: APISettings | None = None) -> FastAPI:
+def create_app(
+    settings: APISettings | None = None,
+    *,
+    telemetry: Telemetry | None = None,
+) -> FastAPI:
     """Create an API app whose lifespan owns database resources."""
 
     resolved_settings = settings or APISettings.from_env()
+    resolved_telemetry = telemetry or DEFAULT_TELEMETRY
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -146,6 +152,7 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
                 paper_store=PaperInputStore(resolved_settings.paper_store_root),
                 checkpointer=checkpointer,
                 checkpointer_lock=threading.Lock(),
+                telemetry=resolved_telemetry,
             )
             yield
         finally:
@@ -158,6 +165,56 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    @app.middleware("http")
+    async def observe_request(request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID", "")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", request_id):
+            request_id = uuid4().hex
+        request.state.request_id = request_id
+        task_match = re.match(r"^/api/tasks/([0-9a-fA-F-]{36})(?:/|$)", request.url.path)
+        if task_match:
+            try:
+                request.state.task_id = str(UUID(task_match.group(1)))
+                request.state.thread_id = request.state.task_id
+            except ValueError:
+                pass
+
+        started = time.monotonic_ns()
+        response = None
+        status_code = 500
+        with bind_log_context(
+            service="api",
+            request_id=request_id,
+            task_id=getattr(request.state, "task_id", None),
+            thread_id=getattr(request.state, "thread_id", None),
+        ):
+            try:
+                response = await call_next(request)
+                status_code = response.status_code
+                return response
+            finally:
+                route = getattr(request.scope.get("route"), "path", "unknown")
+                with bind_log_context(
+                    task_id=getattr(request.state, "task_id", None),
+                    thread_id=getattr(request.state, "thread_id", None),
+                ):
+                    resolved_telemetry.record(
+                        "api.request.finished",
+                        operation=(
+                            "http_response_started"
+                            if route == "/api/tasks/{task_id}/events"
+                            else "http_request"
+                        ),
+                        method=request.method,
+                        route=route,
+                        status="completed" if status_code < 500 else "error",
+                        status_code=status_code,
+                        duration_ms=(time.monotonic_ns() - started) / 1_000_000,
+                        error_category="infrastructure" if status_code >= 500 else None,
+                    )
+                if response is not None:
+                    response.headers["X-Request-ID"] = request_id
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(_request: Request, _exc: RequestValidationError) -> JSONResponse:
@@ -180,12 +237,22 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
 
     @app.exception_handler(SQLAlchemyError)
     async def database_error_handler(_request: Request, _exc: SQLAlchemyError) -> JSONResponse:
-        logger.error("RISE API database operation failed (%s)", type(_exc).__name__)
+        resolved_telemetry.record(
+            "api.database_operation_failed",
+            status="error",
+            error_category="infrastructure",
+            error_type=type(_exc).__name__,
+        )
         return _error(503, "database_unavailable", "database operation is temporarily unavailable")
 
     @app.exception_handler(Exception)
     async def internal_error_handler(_request: Request, exc: Exception) -> JSONResponse:
-        logger.error("RISE API request failed (%s)", type(exc).__name__)
+        resolved_telemetry.record(
+            "api.request_failed",
+            status="error",
+            error_category="infrastructure",
+            error_type=type(exc).__name__,
+        )
         return _error(500, "internal_error", "request could not be completed")
 
     @app.get("/health/live")
@@ -207,7 +274,12 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
         try:
             await run_in_threadpool(probe)
         except Exception as exc:
-            logger.error("RISE API readiness probe failed (%s)", type(exc).__name__)
+            resolved_telemetry.record(
+                "api.readiness_probe_failed",
+                status="error",
+                error_category="infrastructure",
+                error_type=type(exc).__name__,
+            )
             return JSONResponse(
                 status_code=503,
                 content={"status": "not_ready", "reason": "database_unavailable"},
@@ -252,6 +324,21 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> TaskAccepted:
         resources = _resources(request)
+        started = time.monotonic_ns()
+
+        def accepted(task: TaskRecord, *, replay: bool) -> TaskAccepted:
+            request.state.task_id = str(task.id)
+            request.state.thread_id = str(task.thread_id)
+            with bind_log_context(task_id=str(task.id), thread_id=str(task.thread_id)):
+                resources.telemetry.record(
+                    "api.task.submission_replayed" if replay else "api.task.submitted",
+                    operation="task_submission",
+                    status=task.task_status,
+                    task_status=task.task_status,
+                    duration_ms=(time.monotonic_ns() - started) / 1_000_000,
+                )
+            return _accepted(task, replay=replay)
+
         if idempotency_key is not None:
             idempotency_key = idempotency_key.strip()
             if not _KEY_RE.fullmatch(idempotency_key):
@@ -276,7 +363,7 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
             if existing is not None:
                 if existing.request_sha256 != request_sha256:
                     raise IdempotencyConflict
-                return _accepted(existing, replay=True)
+                return accepted(existing, replay=True)
 
         try:
             paper_ref = await run_in_threadpool(resources.paper_store.persist, raw_markdown)
@@ -303,7 +390,7 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(422, detail="execution_config is invalid") from exc
-        return _accepted(task, replay=existing is not None)
+        return accepted(task, replay=existing is not None)
 
     @app.get("/api/tasks", response_model=TaskList)
     async def list_tasks(
@@ -344,7 +431,12 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
 
             state = await run_in_threadpool(read_state)
         except CheckpointResultError as exc:
-            logger.error("RISE result checkpoint is invalid for task %s", task_id)
+            resources.telemetry.record(
+                "api.result_checkpoint_invalid",
+                status="error",
+                error_category="infrastructure",
+                error_type=type(exc).__name__,
+            )
             raise HTTPException(503, detail="persisted result is temporarily unavailable") from exc
         if task.task_status == "completed" and state is None:
             raise HTTPException(503, detail="persisted result is temporarily unavailable")
@@ -372,6 +464,15 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
     async def cancel_task(task_id: UUID, request: Request) -> TaskSummary:
         resources = _resources(request)
         task = await run_in_threadpool(resources.repository.request_cancel, task_id)
+        request.state.task_id = str(task.id)
+        request.state.thread_id = str(task.thread_id)
+        resources.telemetry.record(
+            "api.task.cancel_requested",
+            operation="cancel_request",
+            status=task.task_status,
+            task_status=task.task_status,
+            error_category="cancelled" if task.task_status == "cancel_requested" else None,
+        )
         return await _task_summary(resources, task)
 
     @app.get("/api/tasks/{task_id}/events")
@@ -499,46 +600,77 @@ async def _event_stream(
 ) -> AsyncIterator[str]:
     cursor = after_seq
     last_heartbeat = time.monotonic()
-    while True:
-        if await request.is_disconnected():
-            return
+    started = time.monotonic_ns()
+    emitted_events = 0
+    stream_status = "disconnected"
+    with bind_log_context(
+        service="api",
+        request_id=getattr(request.state, "request_id", None),
+        task_id=str(task_id),
+        thread_id=str(task_id),
+    ):
         try:
-            batch = await run_in_threadpool(
-                partial(resources.repository.list_events, task_id, after_seq=cursor, limit=500)
-            )
-            for event in batch:
-                cursor = event.seq
-                yield _format_sse(event)
-            if len(batch) == 500:
-                continue
-            task = await run_in_threadpool(resources.repository.get_task, task_id)
-            if task.task_status in _TERMINAL_STATUSES:
-                # Re-read after observing the terminal commit. This closes the
-                # race where the first read started just before its final event
-                # and the terminal status became visible immediately after it.
-                final_events = await run_in_threadpool(
-                    partial(resources.repository.list_events, task_id, after_seq=cursor, limit=500)
-                )
-                if final_events:
-                    for event in final_events:
+            while True:
+                if await request.is_disconnected():
+                    return
+                try:
+                    batch = await run_in_threadpool(
+                        partial(resources.repository.list_events, task_id, after_seq=cursor, limit=500)
+                    )
+                    for event in batch:
                         cursor = event.seq
+                        emitted_events += 1
                         yield _format_sse(event)
-                    if len(final_events) == 500:
+                    if len(batch) == 500:
                         continue
-                return
-        except TaskNotFound:
-            yield _format_sse_error("task_not_found")
-            return
-        except Exception as exc:
-            logger.error("RISE SSE polling failed (%s)", type(exc).__name__)
-            yield _format_sse_error("event_store_unavailable")
-            return
+                    task = await run_in_threadpool(resources.repository.get_task, task_id)
+                    if task.task_status in _TERMINAL_STATUSES:
+                        # Re-read after observing the terminal commit. This closes the
+                        # race where the first read started just before its final event
+                        # and the terminal status became visible immediately after it.
+                        final_events = await run_in_threadpool(
+                            partial(resources.repository.list_events, task_id, after_seq=cursor, limit=500)
+                        )
+                        if final_events:
+                            for event in final_events:
+                                cursor = event.seq
+                                emitted_events += 1
+                                yield _format_sse(event)
+                            if len(final_events) == 500:
+                                continue
+                        stream_status = "completed"
+                        return
+                except TaskNotFound:
+                    stream_status = "error"
+                    yield _format_sse_error("task_not_found")
+                    return
+                except Exception as exc:
+                    stream_status = "error"
+                    resources.telemetry.record(
+                        "api.sse_poll_failed",
+                        operation="sse_poll",
+                        status="error",
+                        error_category="infrastructure",
+                        error_type=type(exc).__name__,
+                        task_id=str(task_id),
+                        thread_id=str(task_id),
+                    )
+                    yield _format_sse_error("event_store_unavailable")
+                    return
 
-        now = time.monotonic()
-        if now - last_heartbeat >= resources.settings.sse_heartbeat_interval:
-            yield ": keep-alive\n\n"
-            last_heartbeat = now
-        await asyncio.sleep(resources.settings.sse_poll_interval)
+                now = time.monotonic()
+                if now - last_heartbeat >= resources.settings.sse_heartbeat_interval:
+                    yield ": keep-alive\n\n"
+                    last_heartbeat = now
+                await asyncio.sleep(resources.settings.sse_poll_interval)
+        finally:
+            resources.telemetry.record(
+                "api.sse.stream_finished",
+                operation="sse_stream",
+                status=stream_status,
+                event_count=emitted_events,
+                duration_ms=(time.monotonic_ns() - started) / 1_000_000,
+            )
 
 
 def _format_sse(event: TaskEventRecord) -> str:

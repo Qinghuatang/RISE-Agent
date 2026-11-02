@@ -3,25 +3,26 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 import os
 import socket
 import threading
 import time
+from contextvars import copy_context
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 from uuid import uuid4
 
 from ..models.seed import SeedPaperContext
+from ..observability.instrumentation import instrument_trajectory_modules
+from ..observability.logging import bind_log_context
+from ..observability.telemetry import DEFAULT_TELEMETRY, Telemetry
 from ..runtime.graph_runner import ACTION_NODE_NAMES, LangGraphTrajectoryRunner
 from ..runtime.graph_state import RISEGraphState
 from ..runtime.paper_store import PaperInputIntegrityError
 from .advisory_lock import ThreadAdvisoryLock
 from .contracts import ExpiredTaskClaim, TaskRecord, TaskStatus
 from .repository import TaskRepository
-
-logger = logging.getLogger(__name__)
 
 WORKER_BOUNDARY_NODES = (
     "bootstrap",
@@ -67,12 +68,14 @@ class _LeaseHeartbeat:
         lease_seconds: float,
         interval: float,
         fail_stop_on_ownership_loss: bool,
+        telemetry: Telemetry,
     ) -> None:
         self.repository = repository
         self.task = task
         self.lease_seconds = lease_seconds
         self.interval = interval
         self.fail_stop_on_ownership_loss = fail_stop_on_ownership_loss
+        self.telemetry = telemetry
         self.lost = threading.Event()
         self._stop = threading.Event()
         self._execution_lock: ThreadAdvisoryLock | None = None
@@ -83,6 +86,12 @@ class _LeaseHeartbeat:
         )
 
     def start(self) -> None:
+        context = copy_context()
+        self._thread = threading.Thread(
+            target=lambda: context.run(self._run),
+            name=f"rise-heartbeat-{self.task.id}",
+            daemon=True,
+        )
         self._thread.start()
 
     def monitor_execution_lock(self, lock: ThreadAdvisoryLock) -> None:
@@ -97,11 +106,14 @@ class _LeaseHeartbeat:
 
     def _lose_ownership(self, reason: str) -> None:
         self.lost.set()
+        self.telemetry.record(
+            "worker.execution_ownership_lost",
+            status="stopping" if self.fail_stop_on_ownership_loss else "lost",
+            error_category="ownership",
+            operation=reason.replace(" ", "_")[:96],
+            error_type="OwnershipLost",
+        )
         if self.fail_stop_on_ownership_loss:
-            logger.critical(
-                "Worker is terminating after losing task execution ownership: %s",
-                reason,
-            )
             # The Worker is a dedicated process. If a node is blocked in an
             # external call, exiting the process prevents it from racing a new
             # owner after PostgreSQL has released the session advisory lock.
@@ -117,16 +129,31 @@ class _LeaseHeartbeat:
                     lease_seconds=self.lease_seconds,
                 )
             except Exception:
-                logger.exception("Worker heartbeat failed for task %s", self.task.id)
+                self.telemetry.record(
+                    "worker.heartbeat_failed",
+                    status="error",
+                    error_category="infrastructure",
+                    error_type="database_heartbeat_error",
+                )
                 self._lose_ownership("database heartbeat failure")
                 return
             if not alive:
-                logger.warning("Worker lease was lost for task %s", self.task.id)
+                self.telemetry.record(
+                    "worker.lease_lost",
+                    status="error",
+                    error_category="ownership",
+                    error_type="lease_token_rejected",
+                )
                 self._lose_ownership("lease token is no longer current")
                 return
             lock = self._execution_lock
             if lock is not None and not lock.check_connection():
-                logger.warning("Worker advisory-lock session was lost for task %s", self.task.id)
+                self.telemetry.record(
+                    "worker.advisory_lock_lost",
+                    status="error",
+                    error_category="ownership",
+                    error_type="advisory_lock_session_lost",
+                )
                 self._lose_ownership("PostgreSQL advisory-lock session was lost")
                 return
 
@@ -147,6 +174,7 @@ class TaskWorker:
         max_recoveries: int = 3,
         fail_stop_on_ownership_loss: bool = True,
         recovery_scan_limit: int = 20,
+        telemetry: Telemetry | None = None,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -171,6 +199,7 @@ class TaskWorker:
         self.max_recoveries = max_recoveries
         self.fail_stop_on_ownership_loss = fail_stop_on_ownership_loss
         self.recovery_scan_limit = recovery_scan_limit
+        self.telemetry = telemetry or DEFAULT_TELEMETRY
         self.stop_event = threading.Event()
         self._run_guard = threading.Lock()
 
@@ -184,16 +213,23 @@ class TaskWorker:
         self.stop_event.set()
 
     def run_forever(self) -> None:
-        logger.info("RISE Worker %s started", self.worker_id)
+        with bind_log_context(service="worker", worker_id=self.worker_id):
+            self.telemetry.record("worker.started", status="started")
         while not self.stop_event.is_set():
             try:
                 worked = self.run_once()
-            except Exception:
-                logger.exception("RISE Worker loop failed")
+            except Exception as exc:
+                self.telemetry.record(
+                    "worker.loop_failed",
+                    status="error",
+                    error_category="infrastructure",
+                    error_type=type(exc).__name__,
+                )
                 worked = False
             if not worked:
                 self.stop_event.wait(self.poll_interval)
-        logger.info("RISE Worker %s stopped", self.worker_id)
+        with bind_log_context(service="worker", worker_id=self.worker_id):
+            self.telemetry.record("worker.stopped", status="stopped")
 
     def run_once(self) -> bool:
         """Process one queued or expired task, returning whether one was claimed."""
@@ -245,12 +281,41 @@ class TaskWorker:
         recovery_exhausted: bool,
         preacquired_lock: ThreadAdvisoryLock | None = None,
     ) -> None:
+        with bind_log_context(
+            service="worker",
+            task_id=str(task.id),
+            thread_id=str(task.thread_id),
+            worker_id=self.worker_id,
+            attempt_count=task.attempt_count,
+            recovery_count=task.recovery_count,
+        ):
+            self.telemetry.record(
+                "worker.task.claimed",
+                status=task.task_status,
+                recovered=task.recovery_count > 0,
+            )
+            self._process_claim_with_context(
+                task,
+                recovery_exhausted=recovery_exhausted,
+                preacquired_lock=preacquired_lock,
+            )
+
+    def _process_claim_with_context(
+        self,
+        task: TaskRecord,
+        *,
+        recovery_exhausted: bool,
+        preacquired_lock: ThreadAdvisoryLock | None = None,
+    ) -> None:
+        attempt_started = time.monotonic_ns()
+        self.telemetry.record("worker.task.attempt_started", status="started")
         heartbeat = _LeaseHeartbeat(
             self.repository,
             task,
             lease_seconds=self.lease_seconds,
             interval=self.heartbeat_interval,
             fail_stop_on_ownership_loss=self.fail_stop_on_ownership_loss,
+            telemetry=self.telemetry,
         )
         heartbeat.start()
         lock = preacquired_lock or ThreadAdvisoryLock(
@@ -276,6 +341,12 @@ class TaskWorker:
         finally:
             heartbeat.stop()
             lock.close()
+            self.telemetry.record(
+                "worker.task.attempt_finished",
+                status="finished",
+                duration_ms=(time.monotonic_ns() - attempt_started) / 1_000_000,
+                recovered=task.recovery_count > 0,
+            )
 
     def _execute_claimed(
         self,
@@ -286,16 +357,30 @@ class TaskWorker:
     ) -> None:
         runtime = self.runtime_factory(task)
         runner = runtime.runner
+        runner.telemetry = self.telemetry
+        instrumentation = instrument_trajectory_modules(runner.modules, self.telemetry)
+        self.telemetry.record(
+            "worker.runtime_instrumented",
+            status="completed",
+            llm_client_count=instrumentation["llm_clients"],
+            retrieval_provider_count=instrumentation["retrieval_providers"],
+        )
         state = runner.load_persistent_state(thread_id=str(task.thread_id))
 
         current = self.repository.get_task(task.id)
         if state is not None and state.rise_status in RISE_TERMINAL_OUTCOMES:
+            self.telemetry.record(
+                "worker.saved_terminal_state_found",
+                status="reconciling",
+                rise_outcome=state.rise_status,
+            )
             self._project_state(task, state)
             self._complete(task, heartbeat, state)
             return
         if current.task_status == TaskStatus.CANCEL_REQUESTED.value and (
             state is None or state.commit_snapshot is None
         ):
+            self.telemetry.record("worker.cancelled_at_boundary", status="cancelled", error_category="cancelled")
             self._cancel(task, heartbeat)
             return
         if recovery_exhausted and (state is None or state.commit_snapshot is None):
@@ -313,6 +398,7 @@ class TaskWorker:
                 return
             try:
                 if state is None:
+                    self.telemetry.record("worker.graph_starting", status="starting")
                     if current.task_status == TaskStatus.CANCEL_REQUESTED.value:
                         self._cancel(task, heartbeat)
                         return
@@ -337,6 +423,7 @@ class TaskWorker:
                         ),
                     )
                 else:
+                    self.telemetry.record("worker.graph_resuming", status="resuming")
                     state = runner.resume_persistent(
                         thread_id=str(task.thread_id),
                         interrupt_before_nodes=WORKER_BOUNDARY_NODES,
@@ -350,7 +437,12 @@ class TaskWorker:
             except Exception as exc:
                 if heartbeat.lost.is_set():
                     return
-                logger.exception("Graph execution failed for task %s", task.id)
+                self.telemetry.record(
+                    "worker.graph_execution_failed",
+                    status="error",
+                    error_category="infrastructure",
+                    error_type=type(exc).__name__,
+                )
                 # The only in-place retry is retained under the same lease when
                 # cancellation and a saved CommitSnapshot require Finalizer work.
                 try:
@@ -397,7 +489,12 @@ class TaskWorker:
                         error_summary=str(exc),
                     )
                 except Exception:
-                    logger.exception("Could not release task %s after runtime error", task.id)
+                    self.telemetry.record(
+                        "worker.recovery_release_failed",
+                        status="error",
+                        error_category="infrastructure",
+                        error_type="repository_update_error",
+                    )
                 return
 
             self._after_graph_checkpoint(task, state)
@@ -407,7 +504,12 @@ class TaskWorker:
                 self._project_state(task, state)
                 current = self.repository.get_task(task.id)
             except Exception as exc:
-                logger.exception("Could not project saved Graph State for task %s", task.id)
+                self.telemetry.record(
+                    "worker.event_projection_failed",
+                    status="error",
+                    error_category="infrastructure",
+                    error_type=type(exc).__name__,
+                )
                 if heartbeat.lost.is_set():
                     return
                 try:
@@ -441,7 +543,12 @@ class TaskWorker:
                         error_summary=str(exc),
                     )
                 except Exception:
-                    logger.exception("Could not schedule projection retry for task %s", task.id)
+                    self.telemetry.record(
+                        "worker.projection_retry_schedule_failed",
+                        status="error",
+                        error_category="infrastructure",
+                        error_type="repository_update_error",
+                    )
                 return
 
             if state.rise_status in RISE_TERMINAL_OUTCOMES:
@@ -477,6 +584,12 @@ class TaskWorker:
             current.task_status == TaskStatus.CANCEL_REQUESTED.value
             and state.commit_snapshot is None
         ):
+            self.telemetry.record(
+                "worker.cancel_requested_at_graph_boundary",
+                status="cancel_requested",
+                graph_node=node_name,
+                error_category="cancelled",
+            )
             return "user_cancellation"
         return None
 
@@ -541,6 +654,18 @@ class TaskWorker:
             error_type=state.error_type,
             error_summary=state.error_message,
         )
+        self.telemetry.record(
+            "worker.task.completed",
+            status="completed",
+            task_status=TaskStatus.COMPLETED.value,
+            rise_outcome=state.rise_status,
+            action_steps_used=state.budget.steps_used,
+            action_steps_remaining=state.budget.remaining_steps,
+            searches_used=state.budget.searches_used,
+            searches_remaining=state.budget.remaining_searches,
+            trajectory_event_count=len(state.trajectory_events),
+            replay_record_count=len(state.replay_records),
+        )
 
     def _cancel(self, task: TaskRecord, heartbeat: _LeaseHeartbeat) -> None:
         if heartbeat.lost.is_set():
@@ -552,6 +677,12 @@ class TaskWorker:
             task_id=task.id,
             worker_id=self.worker_id,
             lease_token=task.lease_token,
+        )
+        self.telemetry.record(
+            "worker.task.cancelled",
+            status=TaskStatus.CANCELLED.value,
+            task_status=TaskStatus.CANCELLED.value,
+            error_category="cancelled",
         )
 
     def _fail_input(
@@ -577,6 +708,14 @@ class TaskWorker:
             error_type=type(error).__name__,
             error_summary=str(error),
         )
+        self.telemetry.record(
+            "worker.task.failed",
+            status=TaskStatus.FAILED.value,
+            task_status=TaskStatus.FAILED.value,
+            failure_kind="input",
+            error_category="input",
+            error_type=type(error).__name__,
+        )
 
     def _mark_infrastructure_failed(
         self,
@@ -596,6 +735,14 @@ class TaskWorker:
             failure_kind="infrastructure",
             error_type=type(error).__name__,
             error_summary=str(error),
+        )
+        self.telemetry.record(
+            "worker.task.failed",
+            status=TaskStatus.FAILED.value,
+            task_status=TaskStatus.FAILED.value,
+            failure_kind="infrastructure",
+            error_category="infrastructure",
+            error_type=type(error).__name__,
         )
 
     def _record_in_place_retry(
@@ -631,10 +778,11 @@ class TaskWorker:
             current = self.repository.get_task(task.id)
             if current.task_status == TaskStatus.CANCEL_REQUESTED.value:
                 updated = self._record_in_place_retry(task, heartbeat, error)
-                logger.error(
-                    "Could not build runtime for cancel-requested task %s; status=%s",
-                    task.id,
-                    updated.task_status,
+                self.telemetry.record(
+                    "worker.runtime_build_failed_for_cancelled_task",
+                    status=updated.task_status,
+                    error_category="infrastructure",
+                    error_type=type(error).__name__,
                 )
                 return
             heartbeat.stop()
@@ -648,8 +796,13 @@ class TaskWorker:
                 error_type=type(error).__name__,
                 error_summary=str(error),
             )
-        except Exception:
-            logger.exception("Could not record runtime setup failure for task %s", task.id)
+        except Exception as exc:
+            self.telemetry.record(
+                "worker.runtime_setup_failure_record_failed",
+                status="error",
+                error_category="infrastructure",
+                error_type=type(exc).__name__,
+            )
 
     @staticmethod
     def _resolve_seed_context(

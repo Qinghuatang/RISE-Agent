@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import importlib
-import logging
 import os
 import signal
 from typing import Any
 
+from ..observability.logging import configure_logging
 from .worker import TaskWorker
 
 
@@ -24,10 +24,7 @@ def _load_worker(specification: str) -> TaskWorker:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=os.environ.get("RISE_LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging()
     specification = os.environ.get("RISE_WORKER_FACTORY")
     if not specification:
         raise RuntimeError("set RISE_WORKER_FACTORY to 'module:callable'")
