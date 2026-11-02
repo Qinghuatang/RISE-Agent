@@ -8,6 +8,7 @@ and ``RISEActionAdapter``.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextlib import nullcontext
 from pathlib import Path
 from threading import Lock, RLock
 import time
@@ -20,6 +21,7 @@ from ..models.base import ScientificAction
 from ..models.seed import SeedPaperContext
 from ..runner.trajectory_runner import TrajectoryModules
 from ..observability.logging import bind_log_context
+from ..observability.langfuse import LangfuseTracer
 from ..observability.telemetry import DEFAULT_TELEMETRY, Telemetry
 from .action_adapter import RISEActionAdapter
 from .graph_state import (
@@ -107,6 +109,7 @@ class LangGraphTrajectoryRunner:
         checkpointer: Any | None = None,
         paper_store: PaperInputStore | None = None,
         telemetry: Telemetry | None = None,
+        tracer: LangfuseTracer | None = None,
     ) -> None:
         self.modules = modules
         self.adapter = RISEActionAdapter(modules)
@@ -116,6 +119,7 @@ class LangGraphTrajectoryRunner:
         self.checkpointer = checkpointer
         self.paper_store = paper_store
         self.telemetry = telemetry or DEFAULT_TELEMETRY
+        self.tracer = tracer
 
     @property
     def recursion_limit(self) -> int:
@@ -157,10 +161,24 @@ class LangGraphTrajectoryRunner:
             def execute(raw_state: Any) -> dict[str, Any]:
                 state = _as_graph_state(raw_state)
                 started = time.monotonic_ns()
-                with bind_log_context(
-                    thread_id=state.run_id,
-                    graph_node=node_name,
-                    action=action,
+                trace_scope = (
+                    self.tracer.span(
+                        f"rise.graph.{node_name}",
+                        observation_type="agent" if node_name in {"controller", "bootstrap"} else "span",
+                        trace_id=state.run_id,
+                        metadata={
+                            "task_id": state.run_id,
+                            "thread_id": state.run_id,
+                            "graph_node": node_name,
+                            "action": action,
+                            "operation": "graph_node",
+                        },
+                    )
+                    if self.tracer is not None
+                    else nullcontext(None)
+                )
+                with trace_scope as trace_span, bind_log_context(
+                    thread_id=state.run_id, graph_node=node_name, action=action
                 ):
                     self.telemetry.record(
                         "graph.node.started",
@@ -192,6 +210,12 @@ class LangGraphTrajectoryRunner:
                         decision_action = updated.controller_routing.decision.action
                         selected_action = str(getattr(decision_action, "value", decision_action))
                     with bind_log_context(action=selected_action):
+                        if trace_span is not None:
+                            trace_span.update(
+                                action=selected_action,
+                                rise_outcome=updated.rise_status,
+                                status="completed",
+                            )
                         self.telemetry.record(
                             "graph.node.finished",
                             operation=node_name,

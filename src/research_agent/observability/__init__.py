@@ -5,6 +5,7 @@ from .instrumentation import (
     ObservedRetrievalProvider,
     instrument_trajectory_modules,
 )
+from .langfuse import LangfuseTracer, task_trace_id
 from .logging import (
     bind_log_context,
     configure_logging,
@@ -15,6 +16,7 @@ from .telemetry import DEFAULT_TELEMETRY, Telemetry
 
 __all__ = [
     "DEFAULT_TELEMETRY",
+    "LangfuseTracer",
     "ObservedLLMClient",
     "ObservedRetrievalProvider",
     "Telemetry",
@@ -23,4 +25,5 @@ __all__ = [
     "current_log_context",
     "emit_event",
     "instrument_trajectory_modules",
+    "task_trace_id",
 ]

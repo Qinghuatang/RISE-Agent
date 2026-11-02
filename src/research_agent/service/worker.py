@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from ..models.seed import SeedPaperContext
 from ..observability.instrumentation import instrument_trajectory_modules
+from ..observability.langfuse import LangfuseTracer, task_trace_id
 from ..observability.logging import bind_log_context
 from ..observability.telemetry import DEFAULT_TELEMETRY, Telemetry
 from ..runtime.graph_runner import ACTION_NODE_NAMES, LangGraphTrajectoryRunner
@@ -175,6 +176,7 @@ class TaskWorker:
         fail_stop_on_ownership_loss: bool = True,
         recovery_scan_limit: int = 20,
         telemetry: Telemetry | None = None,
+        tracer: LangfuseTracer | None = None,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -200,6 +202,7 @@ class TaskWorker:
         self.fail_stop_on_ownership_loss = fail_stop_on_ownership_loss
         self.recovery_scan_limit = recovery_scan_limit
         self.telemetry = telemetry or DEFAULT_TELEMETRY
+        self.tracer = tracer if tracer is not None else LangfuseTracer.from_env(self.telemetry)
         self.stop_event = threading.Event()
         self._run_guard = threading.Lock()
 
@@ -215,21 +218,24 @@ class TaskWorker:
     def run_forever(self) -> None:
         with bind_log_context(service="worker", worker_id=self.worker_id):
             self.telemetry.record("worker.started", status="started")
-        while not self.stop_event.is_set():
-            try:
-                worked = self.run_once()
-            except Exception as exc:
-                self.telemetry.record(
-                    "worker.loop_failed",
-                    status="error",
-                    error_category="infrastructure",
-                    error_type=type(exc).__name__,
-                )
-                worked = False
-            if not worked:
-                self.stop_event.wait(self.poll_interval)
-        with bind_log_context(service="worker", worker_id=self.worker_id):
-            self.telemetry.record("worker.stopped", status="stopped")
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    worked = self.run_once()
+                except Exception as exc:
+                    self.telemetry.record(
+                        "worker.loop_failed",
+                        status="error",
+                        error_category="infrastructure",
+                        error_type=type(exc).__name__,
+                    )
+                    worked = False
+                if not worked:
+                    self.stop_event.wait(self.poll_interval)
+        finally:
+            with bind_log_context(service="worker", worker_id=self.worker_id):
+                self.telemetry.record("worker.stopped", status="stopped")
+            self.tracer.shutdown()
 
     def run_once(self) -> bool:
         """Process one queued or expired task, returning whether one was claimed."""
@@ -307,6 +313,32 @@ class TaskWorker:
         recovery_exhausted: bool,
         preacquired_lock: ThreadAdvisoryLock | None = None,
     ) -> None:
+        with self.tracer.span(
+            "rise.worker_attempt",
+            observation_type="agent",
+            trace_id=task_trace_id(str(task.id)),
+            metadata={
+                "task_id": str(task.id),
+                "thread_id": str(task.thread_id),
+                "worker_id": self.worker_id,
+                "attempt_count": task.attempt_count,
+                "recovery_count": task.recovery_count,
+                "operation": "worker_attempt",
+            },
+        ):
+            self._process_claim_attempt(
+                task,
+                recovery_exhausted=recovery_exhausted,
+                preacquired_lock=preacquired_lock,
+            )
+
+    def _process_claim_attempt(
+        self,
+        task: TaskRecord,
+        *,
+        recovery_exhausted: bool,
+        preacquired_lock: ThreadAdvisoryLock | None = None,
+    ) -> None:
         attempt_started = time.monotonic_ns()
         self.telemetry.record("worker.task.attempt_started", status="started")
         heartbeat = _LeaseHeartbeat(
@@ -358,7 +390,12 @@ class TaskWorker:
         runtime = self.runtime_factory(task)
         runner = runtime.runner
         runner.telemetry = self.telemetry
-        instrumentation = instrument_trajectory_modules(runner.modules, self.telemetry)
+        runner.tracer = self.tracer
+        instrumentation = instrument_trajectory_modules(
+            runner.modules,
+            self.telemetry,
+            tracer=self.tracer,
+        )
         self.telemetry.record(
             "worker.runtime_instrumented",
             status="completed",

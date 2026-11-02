@@ -19,6 +19,7 @@ api = [
     "uvicorn[standard]>=0.30,<1.0",
     "python-multipart>=0.0.9,<1.0",
 ]
+langfuse = ["langfuse==4.15.4"]
 
 [project.scripts]
 research-agent = "research_agent.__main__:main"

@@ -33,6 +33,7 @@ from starlette.concurrency import run_in_threadpool
 from ..runtime.checkpointer import open_postgres_checkpointer
 from ..runtime.graph_state import RISEGraphState
 from ..runtime.paper_store import PaperInputIntegrityError, PaperInputStore
+from ..observability.langfuse import LangfuseTracer, task_trace_id
 from ..observability.logging import bind_log_context
 from ..observability.telemetry import DEFAULT_TELEMETRY, Telemetry
 from .checkpoint_results import CheckpointResultError, read_checkpoint_state
@@ -116,6 +117,7 @@ class APIResources:
     checkpointer: Any
     checkpointer_lock: threading.Lock
     telemetry: Telemetry
+    tracer: LangfuseTracer
 
 
 class _Submission(BaseModel):
@@ -128,15 +130,22 @@ def create_app(
     settings: APISettings | None = None,
     *,
     telemetry: Telemetry | None = None,
+    tracer: LangfuseTracer | None = None,
 ) -> FastAPI:
     """Create an API app whose lifespan owns database resources."""
 
     resolved_settings = settings or APISettings.from_env()
     resolved_telemetry = telemetry or DEFAULT_TELEMETRY
+    injected_tracer = tracer
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine = create_business_engine(resolved_settings.database_url)
+        app_tracer = (
+            injected_tracer
+            if injected_tracer is not None
+            else LangfuseTracer.from_env(resolved_telemetry)
+        )
         saver_context = None
         saver_entered = False
         try:
@@ -153,12 +162,16 @@ def create_app(
                 checkpointer=checkpointer,
                 checkpointer_lock=threading.Lock(),
                 telemetry=resolved_telemetry,
+                tracer=app_tracer,
             )
             yield
         finally:
-            if saver_context is not None and saver_entered:
-                await run_in_threadpool(saver_context.__exit__, None, None, None)
-            engine.dispose()
+            try:
+                if saver_context is not None and saver_entered:
+                    await run_in_threadpool(saver_context.__exit__, None, None, None)
+            finally:
+                app_tracer.shutdown()
+                engine.dispose()
 
     app = FastAPI(
         title="RISE Agent API",
@@ -330,13 +343,27 @@ def create_app(
             request.state.task_id = str(task.id)
             request.state.thread_id = str(task.thread_id)
             with bind_log_context(task_id=str(task.id), thread_id=str(task.thread_id)):
-                resources.telemetry.record(
-                    "api.task.submission_replayed" if replay else "api.task.submitted",
-                    operation="task_submission",
-                    status=task.task_status,
-                    task_status=task.task_status,
-                    duration_ms=(time.monotonic_ns() - started) / 1_000_000,
-                )
+                duration_ms = (time.monotonic_ns() - started) / 1_000_000
+                event = "api.task.submission_replayed" if replay else "api.task.submitted"
+                with resources.tracer.span(
+                    "rise.api.task_submission",
+                    trace_id=task_trace_id(str(task.id)),
+                    metadata={
+                        "task_id": str(task.id),
+                        "thread_id": str(task.thread_id),
+                        "operation": "task_submission",
+                        "task_status": task.task_status,
+                        "idempotent_replay": replay,
+                        "duration_ms": duration_ms,
+                    },
+                ):
+                    resources.telemetry.record(
+                        event,
+                        operation="task_submission",
+                        status=task.task_status,
+                        task_status=task.task_status,
+                        duration_ms=duration_ms,
+                    )
             return _accepted(task, replay=replay)
 
         if idempotency_key is not None:

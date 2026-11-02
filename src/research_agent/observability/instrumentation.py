@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from functools import wraps
 import time
 from typing import Any, TypeVar
 
 from ..llm.client import LLMClient, LLMRequest, StructuredLLMResponse, T
+from .langfuse import LangfuseTracer
 from .telemetry import DEFAULT_TELEMETRY, Telemetry
 
 class ObservedLLMClient(LLMClient):
@@ -19,9 +21,15 @@ class ObservedLLMClient(LLMClient):
 
     _rise_observed_llm = True
 
-    def __init__(self, inner: LLMClient, telemetry: Telemetry = DEFAULT_TELEMETRY) -> None:
+    def __init__(
+        self,
+        inner: LLMClient,
+        telemetry: Telemetry = DEFAULT_TELEMETRY,
+        tracer: LangfuseTracer | None = None,
+    ) -> None:
         self.inner = inner
         self.telemetry = telemetry
+        self.tracer = tracer
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.inner, name)
@@ -52,52 +60,86 @@ class ObservedLLMClient(LLMClient):
     ) -> StructuredLLMResponse[T]:
         started = time.monotonic_ns()
         provider, model = self._provider_model(self.inner)
-        try:
-            response = self.inner.complete_structured(request, output_schema)
-        except Exception as exc:
+        trace_scope = (
+            self.tracer.span(
+                "rise.llm.complete_structured",
+                observation_type="generation",
+                trace_id=self.tracer.current_trace_id(),
+                metadata={"provider": provider, "operation": "complete_structured"},
+                model=model,
+            )
+            if self.tracer is not None
+            else nullcontext(None)
+        )
+        with trace_scope as trace_span:
+            try:
+                response = self.inner.complete_structured(request, output_schema)
+            except Exception as exc:
+                duration_ms = (time.monotonic_ns() - started) / 1_000_000
+                if trace_span is not None:
+                    trace_span.mark_error(error_type=type(exc).__name__, error_category="llm")
+                    trace_span.update(
+                        provider_retry_count=self._provider_retry_count(self.inner),
+                        duration_ms=duration_ms,
+                    )
+                self.telemetry.record(
+                    "llm.call",
+                    operation="complete_structured",
+                    provider=provider,
+                    model=model,
+                    duration_ms=duration_ms,
+                    status="error",
+                    success=False,
+                    error_category="llm",
+                    error_type=type(exc).__name__,
+                    prompt_tokens=None,
+                    completion_tokens=None,
+                    total_tokens=None,
+                    token_usage_known=False,
+                    provider_retry_count=self._provider_retry_count(self.inner),
+                    format_retry_count=None,
+                )
+                raise
+
+            response_metadata = response.metadata
+            prompt_tokens = getattr(response_metadata, "prompt_tokens", None)
+            completion_tokens = getattr(response_metadata, "completion_tokens", None)
+            total_tokens = getattr(response_metadata, "total_tokens", None)
+            retry_count = getattr(response_metadata, "format_retry_count", None)
+            resolved_provider = getattr(response_metadata, "provider", provider)
+            resolved_model = getattr(response_metadata, "model", model)
+            duration_ms = (time.monotonic_ns() - started) / 1_000_000
+            if trace_span is not None:
+                trace_span.update(
+                    provider=resolved_provider,
+                    model=resolved_model,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    provider_retry_count=self._provider_retry_count(self.inner),
+                    format_retry_count=retry_count,
+                    duration_ms=duration_ms,
+                    status="completed",
+                )
             self.telemetry.record(
                 "llm.call",
                 operation="complete_structured",
-                provider=provider,
-                model=model,
-                duration_ms=(time.monotonic_ns() - started) / 1_000_000,
-                status="error",
-                success=False,
-                error_category="llm",
-                error_type=type(exc).__name__,
-                prompt_tokens=None,
-                completion_tokens=None,
-                total_tokens=None,
-                token_usage_known=False,
+                provider=resolved_provider,
+                model=resolved_model,
+                duration_ms=duration_ms,
+                status="completed",
+                success=True,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                token_usage_known=all(
+                    value is not None
+                    for value in (prompt_tokens, completion_tokens, total_tokens)
+                ),
                 provider_retry_count=self._provider_retry_count(self.inner),
-                format_retry_count=None,
+                format_retry_count=retry_count,
             )
-            raise
-
-        metadata = response.metadata
-        prompt_tokens = getattr(metadata, "prompt_tokens", None)
-        completion_tokens = getattr(metadata, "completion_tokens", None)
-        total_tokens = getattr(metadata, "total_tokens", None)
-        retry_count = getattr(metadata, "format_retry_count", None)
-        self.telemetry.record(
-            "llm.call",
-            operation="complete_structured",
-            provider=getattr(metadata, "provider", provider),
-            model=getattr(metadata, "model", model),
-            duration_ms=(time.monotonic_ns() - started) / 1_000_000,
-            status="completed",
-            success=True,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            token_usage_known=all(
-                value is not None
-                for value in (prompt_tokens, completion_tokens, total_tokens)
-            ),
-            provider_retry_count=self._provider_retry_count(self.inner),
-            format_retry_count=retry_count,
-        )
-        return response
+            return response
 
 
 class ObservedRetrievalProvider:
@@ -105,9 +147,15 @@ class ObservedRetrievalProvider:
 
     _rise_observed_retrieval = True
 
-    def __init__(self, inner: object, telemetry: Telemetry = DEFAULT_TELEMETRY) -> None:
+    def __init__(
+        self,
+        inner: object,
+        telemetry: Telemetry = DEFAULT_TELEMETRY,
+        tracer: LangfuseTracer | None = None,
+    ) -> None:
         self.inner = inner
         self.telemetry = telemetry
+        self.tracer = tracer
 
     def __getattr__(self, name: str) -> Any:
         value = getattr(self.inner, name)
@@ -119,59 +167,104 @@ class ObservedRetrievalProvider:
             started = time.monotonic_ns()
             provider = getattr(self.inner, "provider_name", None)
             provider = provider if isinstance(provider, str) else type(self.inner).__name__
-            try:
-                result = value(*args, **kwargs)
-            except Exception as exc:
+            trace_scope = (
+                self.tracer.span(
+                    "rise.retrieval.call",
+                    observation_type="retriever",
+                    trace_id=self.tracer.current_trace_id(),
+                    metadata={"provider": provider, "operation": name},
+                )
+                if self.tracer is not None
+                else nullcontext(None)
+            )
+            with trace_scope as trace_span:
+                try:
+                    result = value(*args, **kwargs)
+                except Exception as exc:
+                    duration_ms = (time.monotonic_ns() - started) / 1_000_000
+                    request_count = getattr(self.inner, "last_request_count", None)
+                    retry_count = getattr(self.inner, "last_retry_count", None)
+                    if trace_span is not None:
+                        trace_span.mark_error(error_type=type(exc).__name__, error_category="retrieval")
+                        trace_span.update(
+                            http_request_count=request_count,
+                            provider_retry_count=retry_count,
+                            duration_ms=duration_ms,
+                        )
+                    self.telemetry.record(
+                        "retrieval.call",
+                        operation=name,
+                        provider=provider,
+                        duration_ms=duration_ms,
+                        status="error",
+                        success=False,
+                        error_category="retrieval",
+                        error_type=type(exc).__name__,
+                        http_request_count=request_count,
+                        provider_retry_count=retry_count,
+                    )
+                    raise
+
+                cache_hit = getattr(self.inner, "last_cache_hit", None)
+                if cache_hit is None:
+                    cache_hit = getattr(self.inner, "last_global_cache_hit", None)
+                request_count = getattr(self.inner, "last_request_count", None)
+                retry_count = getattr(self.inner, "last_retry_count", None)
+                duration_ms = (time.monotonic_ns() - started) / 1_000_000
+                if trace_span is not None:
+                    trace_span.update(
+                        http_request_count=request_count,
+                        provider_retry_count=retry_count,
+                        cache_hit=cache_hit if isinstance(cache_hit, bool) else None,
+                        duration_ms=duration_ms,
+                        status="completed",
+                    )
                 self.telemetry.record(
                     "retrieval.call",
                     operation=name,
                     provider=provider,
-                    duration_ms=(time.monotonic_ns() - started) / 1_000_000,
-                    status="error",
-                    success=False,
-                    error_category="retrieval",
-                    error_type=type(exc).__name__,
-                    http_request_count=getattr(self.inner, "last_request_count", None),
-                    provider_retry_count=getattr(self.inner, "last_retry_count", None),
+                    duration_ms=duration_ms,
+                    status="completed",
+                    success=True,
+                    http_request_count=request_count,
+                    provider_retry_count=retry_count,
+                    cache_hit=cache_hit if isinstance(cache_hit, bool) else None,
                 )
-                raise
-
-            cache_hit = getattr(self.inner, "last_cache_hit", None)
-            if cache_hit is None:
-                cache_hit = getattr(self.inner, "last_global_cache_hit", None)
-            self.telemetry.record(
-                "retrieval.call",
-                operation=name,
-                provider=provider,
-                duration_ms=(time.monotonic_ns() - started) / 1_000_000,
-                status="completed",
-                success=True,
-                http_request_count=getattr(self.inner, "last_request_count", None),
-                provider_retry_count=getattr(self.inner, "last_retry_count", None),
-                cache_hit=cache_hit if isinstance(cache_hit, bool) else None,
-            )
-            return result
+                return result
 
         return measured
 
 
-def _wrap_llm(client: object, telemetry: Telemetry) -> object:
+def _wrap_llm(
+    client: object,
+    telemetry: Telemetry,
+    tracer: LangfuseTracer | None,
+) -> object:
     if getattr(client, "_rise_observed_llm", False):
         client.telemetry = telemetry
+        if tracer is not None:
+            client.tracer = tracer
         return client
-    return ObservedLLMClient(client, telemetry)  # type: ignore[arg-type]
+    return ObservedLLMClient(client, telemetry, tracer)  # type: ignore[arg-type]
 
 
-def _wrap_retrieval(provider: object, telemetry: Telemetry) -> object:
+def _wrap_retrieval(
+    provider: object,
+    telemetry: Telemetry,
+    tracer: LangfuseTracer | None,
+) -> object:
     if getattr(provider, "_rise_observed_retrieval", False):
         provider.telemetry = telemetry
+        if tracer is not None:
+            provider.tracer = tracer
         return provider
-    return ObservedRetrievalProvider(provider, telemetry)
+    return ObservedRetrievalProvider(provider, telemetry, tracer)
 
 
 def instrument_trajectory_modules(
     modules: object,
     telemetry: Telemetry = DEFAULT_TELEMETRY,
+    tracer: LangfuseTracer | None = None,
 ) -> dict[str, int]:
     """Instrument shared clients once at the Worker runtime assembly boundary.
 
@@ -194,7 +287,7 @@ def instrument_trajectory_modules(
         if client is not None:
             wrapper = llm_wrappers.get(id(client))
             if wrapper is None:
-                wrapper = _wrap_llm(client, telemetry)
+                wrapper = _wrap_llm(client, telemetry, tracer)
                 llm_wrappers[id(client)] = wrapper
             try:
                 setattr(module, "llm_client", wrapper)
@@ -216,7 +309,7 @@ def instrument_trajectory_modules(
                 continue
             wrapper = retrieval_wrappers.get(id(provider))
             if wrapper is None:
-                wrapper = _wrap_retrieval(provider, telemetry)
+                wrapper = _wrap_retrieval(provider, telemetry, tracer)
                 retrieval_wrappers[id(provider)] = wrapper
             try:
                 setattr(module, attribute, wrapper)
