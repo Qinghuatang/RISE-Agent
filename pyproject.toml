@@ -10,14 +10,20 @@ requires-python = ">=3.10"
 dependencies = ["pydantic>=2.0,<3.0"]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
+test = ["pytest>=8.0", "httpx>=0.27,<1.0"]
 agent = ["langgraph==1.2.15"]
 postgres = ["langgraph-checkpoint-postgres==3.1.3", "psycopg[binary]>=3.2.0,<4.0.0"]
 service = ["SQLAlchemy>=2.0,<3.0", "alembic>=1.13,<2.0"]
+api = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    "python-multipart>=0.0.9,<1.0",
+]
 
 [project.scripts]
 research-agent = "research_agent.__main__:main"
 research-agent-worker = "research_agent.service.worker_cli:main"
+research-agent-api = "research_agent.service.api_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
