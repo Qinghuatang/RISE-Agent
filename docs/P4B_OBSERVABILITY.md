@@ -16,6 +16,8 @@ The formatter is installed on an existing root handler when possible, so
 repeated initialization does not add duplicate handlers. Both JSON and plain
 formats serialize only event names and allowlisted scalar fields; arbitrary log
 messages and exception text are not emitted.
+JSON events carry an `event_id` so offline evaluation can deduplicate the same
+captured line when log files overlap.
 
 ## Correlation and privacy
 

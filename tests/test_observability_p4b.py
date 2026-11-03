@@ -129,6 +129,8 @@ def test_json_formatter_uses_allowlisted_fields_and_redacts_unrecognized_data():
         logger.propagate = original_propagate
 
     assert payload["event"] == "test.observation"
+    assert isinstance(payload["event_id"], str) and len(payload["event_id"]) == 32
+    assert json.loads(JSONFormatter().format(handler.records[-1]))["event_id"] == payload["event_id"]
     assert payload["task_id"] == "ab55be3b-0d22-4cc8-b82c-c09f7ed8e2f0"
     assert payload["worker_id"] == "worker-test-1"
     assert payload["duration_ms"] == 12.346

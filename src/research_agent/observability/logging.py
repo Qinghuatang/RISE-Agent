@@ -13,6 +13,7 @@ import re
 import sys
 import threading
 from typing import Any, Iterator, Mapping
+from uuid import uuid4
 
 
 _CONTEXT_FIELDS = frozenset(
@@ -195,6 +196,11 @@ class JSONFormatter(logging.Formatter):
             "logger": record.name[:160],
             "event": event,
         }
+        event_id = getattr(record, "rise_event_id", None)
+        if not isinstance(event_id, str):
+            event_id = uuid4().hex
+            record.rise_event_id = event_id
+        payload["event_id"] = event_id
         fields = getattr(record, "rise_fields", {})
         if isinstance(fields, Mapping):
             payload.update(_safe_fields(fields))

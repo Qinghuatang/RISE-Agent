@@ -25,6 +25,7 @@ langfuse = ["langfuse==4.15.4"]
 research-agent = "research_agent.__main__:main"
 research-agent-worker = "research_agent.service.worker_cli:main"
 research-agent-api = "research_agent.service.api_cli:main"
+research-agent-eval = "research_agent.service.evaluation:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

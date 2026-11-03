@@ -7,12 +7,19 @@ from typing import Iterator
 
 
 @contextmanager
-def open_postgres_checkpointer(database_url: str) -> Iterator[object]:
-    """Open and initialize ``PostgresSaver`` with restricted deserialization.
+def open_postgres_checkpointer(
+    database_url: str,
+    *,
+    setup: bool = True,
+) -> Iterator[object]:
+    """Open ``PostgresSaver`` with restricted deserialization.
 
     The returned saver remains valid only inside this context. Checkpoint
     payloads are JSON-compatible Graph State snapshots, so no application
     modules need to be enabled in the MessagePack deserializer allowlist.
+    Runtime owners initialize the schema by default. Read-only tooling can set
+    ``setup=False`` to inspect an existing checkpoint database without schema
+    writes.
     """
 
     try:
@@ -36,7 +43,8 @@ def open_postgres_checkpointer(database_url: str) -> Iterator[object]:
             connection,
             serde=JsonPlusSerializer(allowed_msgpack_modules=[]),
         )
-        saver.setup()
+        if setup:
+            saver.setup()
         yield saver
     finally:
         connection.close()
