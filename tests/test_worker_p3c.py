@@ -262,6 +262,7 @@ import time
 from types import SimpleNamespace
 from uuid import uuid4
 from research_agent.service.worker import _LeaseHeartbeat
+from research_agent.observability.telemetry import DEFAULT_TELEMETRY
 class Repository:
     def heartbeat(self, **kwargs):
         return False
@@ -271,6 +272,7 @@ heartbeat = _LeaseHeartbeat(
     lease_seconds=2,
     interval=0.01,
     fail_stop_on_ownership_loss=True,
+    telemetry=DEFAULT_TELEMETRY,
 )
 heartbeat.start()
 time.sleep(2)

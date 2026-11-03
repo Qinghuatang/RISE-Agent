@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -305,6 +306,8 @@ def test_sse_sends_idle_heartbeat_and_closes_after_terminal_event(api_client: Te
     assert claimed is not None and claimed.id == task_id
 
     class ConnectedRequest:
+        state = SimpleNamespace(request_id="sse-heartbeat-test")
+
         async def is_disconnected(self) -> bool:
             return False
 

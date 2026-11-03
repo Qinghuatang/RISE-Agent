@@ -70,6 +70,7 @@ class ProcessSystem:
         self.base_url = f"http://127.0.0.1:{self.port}"
         self.processes: list[tuple[str, subprocess.Popen, Path]] = []
         self.hook_releases: list[Path] = []
+        self.trace_file: Path | None = None
         self.schema_url = make_url(database_url).update_query_dict(
             {"options": f"-csearch_path={schema}"}
         ).render_as_string(hide_password=False)
@@ -86,6 +87,31 @@ class ProcessSystem:
                 [str(ROOT / "src"), str(ROOT / "tests"), os.environ.get("PYTHONPATH", "")]
             ),
         }
+
+    def enable_trace_capture(self, *, failures: str = "") -> Path:
+        self.trace_file = self.root / "langfuse-test-export.jsonl"
+        self.env["RISE_E2E_TRACE_CAPTURE"] = "1"
+        self.env["RISE_E2E_TRACE_FILE"] = str(self.trace_file)
+        if failures:
+            self.env["RISE_E2E_TRACE_FAILURES"] = failures
+        return self.trace_file
+
+    def trace_records(self) -> list[dict]:
+        if self.trace_file is None or not self.trace_file.exists():
+            return []
+        return [json.loads(line) for line in self.trace_file.read_text().splitlines()]
+
+    def json_log_records(self) -> list[dict]:
+        records = []
+        for _name, _process, path in self.processes:
+            for line in path.read_text(errors="replace").splitlines():
+                try:
+                    decoded = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(decoded, dict):
+                    records.append(decoded)
+        return records
 
     def start_api(self) -> None:
         self._start("api", [sys.executable, "-m", "research_agent.service.api_cli"])
@@ -300,6 +326,63 @@ def _assert_checkpoint_matches_deterministic_baseline(
     ]
 
 
+def _run_evaluation_cli(system: ProcessSystem) -> dict:
+    json_path = system.root / "engineering-evaluation.json"
+    markdown_path = system.root / "engineering-evaluation.md"
+    command = [
+        sys.executable,
+        "-m",
+        "research_agent.service.evaluation",
+        "--database-url",
+        system.schema_url,
+        "--checkpoint-database-url",
+        system.schema_url,
+    ]
+    for _name, _process, path in system.processes:
+        command.extend(["--logs", str(path)])
+    command.extend(["--json-out", str(json_path), "--markdown-out", str(markdown_path)])
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=system.env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert markdown_path.exists()
+    json_text = json_path.read_text(encoding="utf-8")
+    markdown_text = markdown_path.read_text(encoding="utf-8")
+    for private_value in ("Generic supplied seed", "A supplied abstract", "PRIVATE PROMPT", "fixture response"):
+        assert private_value not in json_text
+        assert private_value not in markdown_text
+    return json.loads(json_text)
+
+
+def _assert_trace_hierarchy(records: list[dict], task_id: str, api_pid: int, worker_pid: int) -> None:
+    spans = [row for row in records if row.get("record") == "span_start"]
+    expected_trace_id = UUID(task_id).hex
+    assert spans
+    assert {row["trace_id"] for row in spans} == {expected_trace_id}
+    assert any(
+        row["name"] == "rise.api.task_submission" and row["process_id"] == api_pid
+        for row in spans
+    )
+    attempts = [row for row in spans if row["name"] == "rise.worker_attempt"]
+    assert attempts and all(row["process_id"] == worker_pid for row in attempts)
+    span_by_id = {row["span_id"]: row for row in spans}
+    graph_spans = [row for row in spans if row["name"].startswith("rise.graph.")]
+    llm_spans = [row for row in spans if row["as_type"] == "generation"]
+    retrieval_spans = [row for row in spans if row["as_type"] == "retriever"]
+    assert graph_spans and llm_spans and retrieval_spans
+    attempt_ids = {row["span_id"] for row in attempts}
+    for row in graph_spans:
+        assert row["parent_span_id"] in attempt_ids
+    for row in (*llm_spans, *retrieval_spans):
+        parent = span_by_id[row["parent_span_id"]]
+        assert parent["name"].startswith("rise.graph.")
+
+
 def test_api_worker_graph_checkpoint_result_sse_and_serial_queue(process_system):
     system, _ = process_system
     system.start_api()
@@ -364,6 +447,7 @@ def test_api_worker_graph_checkpoint_result_sse_and_serial_queue(process_system)
 
 def test_worker_process_crash_recovers_checkpoint_and_api_backfills_sse(process_system):
     system, _ = process_system
+    system.enable_trace_capture()
     system.start_api()
     marker = system.root / "crashed-after-action"
     crashed = system.start_worker(
@@ -406,6 +490,100 @@ def test_worker_process_crash_recovers_checkpoint_and_api_backfills_sse(process_
     assert stream.count("event: rise_action_confirmed") == 5
     _assert_checkpoint_matches_deterministic_baseline(system, task_id, PAPER_MARKDOWN)
     assert restarted.poll() is None
+    system.stop_processes()
+    worker_pids = {
+        process.pid
+        for name, process, _path in system.processes
+        if name.startswith("worker-")
+    }
+    trace_rows = system.trace_records()
+    attempt_spans = [
+        row
+        for row in trace_rows
+        if row.get("record") == "span_start" and row.get("name") == "rise.worker_attempt"
+    ]
+    assert len(attempt_spans) == 2
+    assert {row["process_id"] for row in attempt_spans} == worker_pids
+    assert len({row["span_id"] for row in attempt_spans}) == 2
+    assert {row["trace_id"] for row in attempt_spans} == {UUID(task_id).hex}
+    assert {row["metadata"]["attemptCount"] for row in attempt_spans} == {"1", "2"}
+    evaluation = _run_evaluation_cli(system)
+    assert evaluation["task_status"]["counts"]["completed"] == 1
+    assert evaluation["rise_outcomes"]["counts"]["committed"] == 1
+    assert evaluation["actions_and_budget"]["persisted_action_attempt_count"] == 5
+    assert evaluation["checkpoint_event_consistency"]["consistent"] is True
+    assert evaluation["model_and_retrieval_calls"]["llm"]["observed_call_count"] > 0
+    assert evaluation["model_and_retrieval_calls"]["retrieval"]["observed_call_count"] > 0
+
+
+def test_p4_cross_process_logs_trace_hierarchy_and_real_evaluation(process_system):
+    system, _ = process_system
+    trace_file = system.enable_trace_capture()
+    system.start_api()
+    worker = system.start_worker()
+    task_id = system.submit()
+    summary = system.wait_task(task_id)
+    assert summary["task_status"] == "completed"
+    assert summary["rise_outcome"] == "committed"
+    assert worker.poll() is None
+    system.stop_processes()
+
+    api_pid = next(process.pid for name, process, _path in system.processes if name == "api")
+    worker_pid = next(
+        process.pid for name, process, _path in system.processes if name == "worker-normal"
+    )
+    _assert_trace_hierarchy(system.trace_records(), task_id, api_pid, worker_pid)
+
+    structured = system.json_log_records()
+    task_rows = [row for row in structured if row.get("task_id") == task_id]
+    assert any(row.get("event") == "api.task.submitted" for row in task_rows)
+    assert any(row.get("event") == "worker.task.claimed" for row in task_rows)
+    assert any(row.get("event") == "graph.node.finished" for row in task_rows)
+    assert any(row.get("event") == "llm.call" for row in task_rows)
+    assert any(row.get("event") == "retrieval.call" for row in task_rows)
+
+    trace_text = trace_file.read_text(encoding="utf-8")
+    log_text = "\n".join(path.read_text(errors="replace") for _name, _proc, path in system.processes)
+    for private_value in ("Generic supplied seed", "A supplied abstract", "PRIVATE PROMPT", "fixture response"):
+        assert private_value not in trace_text
+        assert private_value not in log_text
+
+    evaluation = _run_evaluation_cli(system)
+    assert evaluation["task_status"]["counts"]["completed"] == 1
+    assert evaluation["rise_outcomes"]["proposal"]["success_rate"] == 1.0
+    assert evaluation["actions_and_budget"]["persisted_action_attempt_count"] == 5
+    assert evaluation["actions_and_budget"]["action_counts_complete"] is True
+    assert evaluation["checkpoint_event_consistency"]["consistent"] is True
+    assert evaluation["model_and_retrieval_calls"]["llm"]["observed_call_count"] == sum(
+        row.get("event") == "llm.call" for row in task_rows
+    )
+    assert evaluation["model_and_retrieval_calls"]["retrieval"]["observed_call_count"] == sum(
+        row.get("event") == "retrieval.call" for row in task_rows
+    )
+
+
+def test_p4_exporter_start_failure_does_not_change_durable_result(process_system):
+    system, _ = process_system
+    system.enable_trace_capture(failures="start")
+    system.start_api()
+    worker = system.start_worker()
+    task_id = system.submit()
+    summary = system.wait_task(task_id)
+    assert summary["task_status"] == "completed"
+    assert summary["rise_outcome"] == "committed"
+    assert worker.poll() is None
+    system.stop_processes()
+
+    structured = system.json_log_records()
+    task_rows = [row for row in structured if row.get("task_id") == task_id]
+    assert any(row.get("event") == "langfuse.span_start_failed" for row in task_rows)
+    assert any(row.get("event") == "llm.call" for row in task_rows)
+    assert any(row.get("event") == "retrieval.call" for row in task_rows)
+    _assert_checkpoint_matches_deterministic_baseline(system, task_id, PAPER_MARKDOWN)
+    evaluation = _run_evaluation_cli(system)
+    assert evaluation["task_status"]["counts"]["completed"] == 1
+    assert evaluation["actions_and_budget"]["persisted_action_attempt_count"] == 5
+    assert evaluation["checkpoint_event_consistency"]["consistent"] is True
 
 
 def test_expired_lease_cannot_bypass_live_workers_thread_advisory_lock(process_system):

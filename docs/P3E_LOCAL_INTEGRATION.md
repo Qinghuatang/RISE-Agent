@@ -62,3 +62,34 @@ configuration. A deployment must supply its own importable Worker factory that
 constructs the intended model and retrieval clients and returns a configured
 `TaskWorker`; provider credentials stay in process configuration and never
 belong in Graph State or the task event payload.
+
+## Start an isolated PostgreSQL test cluster without Docker
+
+`scripts/run_local_postgres_tests.sh` starts a temporary cluster, creates a
+dedicated test database, sets `RISE_TEST_POSTGRES_URL`, runs pytest, then stops
+the server and removes its data directory. It binds only to loopback, selects
+an available port, and uses local trust authentication. Never point it at
+production data.
+
+If PostgreSQL is installed and its binaries are on `PATH`, run:
+
+```bash
+scripts/run_local_postgres_tests.sh
+```
+
+For a nonstandard or split installation, set its binary, shared-library, and
+server-share directories first. For the PostgreSQL 16.15 Conda package cache
+used for this acceptance run, the values were:
+
+```bash
+MINICONDA_ROOT=/path/to/miniconda3
+export RISE_TEST_PYTHON="$MINICONDA_ROOT/envs/myrag/bin/python"
+export RISE_TEST_PG_BIN="$MINICONDA_ROOT/pkgs/postgresql-16.15-h23f1c25_0/bin"
+export RISE_TEST_PG_SHARE="$MINICONDA_ROOT/pkgs/libpq-16.15-hb2dfd55_0/share"
+export RISE_TEST_PG_LIBS="$MINICONDA_ROOT/pkgs/postgresql-16.15-h23f1c25_0/lib:$MINICONDA_ROOT/pkgs/libpq-16.15-hb2dfd55_0/lib:$MINICONDA_ROOT/pkgs/libxml2-16-2.15.4-hf3af7cc_1/lib:$MINICONDA_ROOT/pkgs/icu-78.3-py310h44b86e0_2/lib:$MINICONDA_ROOT/pkgs/libiconv-1.18-h0cb94f2_3/lib"
+scripts/run_local_postgres_tests.sh
+```
+
+The script accepts pytest selectors, for example
+`scripts/run_local_postgres_tests.sh tests/test_p3e_e2e.py`. It removes the
+temporary database and cluster even when pytest fails.

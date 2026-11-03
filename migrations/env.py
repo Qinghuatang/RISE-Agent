@@ -18,7 +18,9 @@ from research_agent.service.db import database_url_from_env, normalize_database_
 from research_agent.service.models import Base
 
 config = context.config
-if config.config_file_name is not None:
+if config.config_file_name is not None and not config.attributes.get(
+    "skip_logging_config", False
+):
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata

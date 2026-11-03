@@ -76,4 +76,8 @@ def upgrade_business_schema(engine: Engine, *, revision: str = "head") -> None:
     config = Config(str(repository_root / "alembic.ini"))
     with engine.connect() as connection:
         config.attributes["connection"] = connection
+        # Keep the hosting API's JSON handler and logger levels intact. The
+        # migration environment can still configure Alembic logging when run
+        # directly through the Alembic CLI.
+        config.attributes["skip_logging_config"] = True
         command.upgrade(config, revision)
